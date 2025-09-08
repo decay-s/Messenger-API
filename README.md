@@ -53,11 +53,7 @@ POST /api/bot{token}/sendMessage
 ## Rate Limits
 - 600 requests per minute per IP
 - Retry-After header included in 429 responses
-```
 
-## 2. صفحه راهنمای نصب و اجرا (Installation Guide)
-
-```markdown
 # Installation and Setup Guide
 
 ## Prerequisites
@@ -115,18 +111,14 @@ CMD ["python", "main.py"]
 - Configure reverse proxy (Nginx)
 - Set up SSL certificate
 - Configure database backups
-```
 
-## 3. صفحه مثال‌های کاربردی (Examples)
-
-```markdown
 # API Usage Examples
 
 ## Python Client Example
 ```python
 import requests
 
-class TelegramClient:
+class Client:
     def __init__(self, token):
         self.base_url = "https://decay1234.pythonanywhere.com/api/bot"
         self.token = token
@@ -140,13 +132,13 @@ class TelegramClient:
         return response.json()
 
 # Usage
-client = TelegramClient("your-token-here")
+client = Client("your-token-here")
 response = client.send_message(1, "Hello!")
 ```
 
 ## JavaScript Example
 ```javascript
-class TelegramClient {
+class Client {
     constructor(token) {
         this.baseUrl = 'https://decay1234.pythonanywhere.com/api/bot';
         this.token = token;
@@ -163,7 +155,7 @@ class TelegramClient {
 }
 
 // Usage
-const client = new TelegramClient('your-token');
+const client = new Client('your-token');
 client.sendMessage(1, 'Hello!').then(console.log);
 ```
 
@@ -191,9 +183,7 @@ try:
 except Exception as e:
     print("Request failed:", e)
 ```
-```
 
-```markdown
 # Error Codes and Troubleshooting
 
 ## Common Error Codes
@@ -244,9 +234,7 @@ Check application logs for:
 - Database queries
 - Request processing
 - Error details
-```
 
-```markdown
 # Best Practices Guide
 
 ## Security
