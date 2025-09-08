@@ -1,4 +1,3 @@
-```markdown
 # Telegram Messenger API Documentation
 
 ## Authentication
