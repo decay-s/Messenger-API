@@ -65,8 +65,8 @@ POST /api/bot{token}/sendMessage
 
 ### 1. Clone Repository
 ```bash
-git clone <repository-url>
-cd messenger-api
+git clone [<repository-url>](https://github.com/decay-s/Messenger-API.git)
+cd Messenger-API
 ```
 
 ### 2. Install Dependencies
@@ -92,18 +92,6 @@ python main.py
 ```bash
 python main.py
 # Server runs on http://localhost:5000
-```
-
-## Docker Deployment
-```dockerfile
-FROM python:3.9-slim
-
-WORKDIR /app
-COPY . .
-RUN pip install -r requirements.txt
-
-EXPOSE 5000
-CMD ["python", "main.py"]
 ```
 
 ## Production Deployment
