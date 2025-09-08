@@ -1,4 +1,4 @@
-# Telegram Messenger API Documentation
+# Messenger API Documentation
 
 ## Authentication
 Most methods require authentication via token.
