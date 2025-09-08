@@ -65,7 +65,7 @@ POST /api/bot{token}/sendMessage
 
 ### 1. Clone Repository
 ```bash
-git clone [<repository-url>](https://github.com/decay-s/Messenger-API.git)
+git clone https://github.com/decay-s/Messenger-API.git
 cd Messenger-API
 ```
 
