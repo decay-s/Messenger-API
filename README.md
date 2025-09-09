@@ -265,4 +265,3 @@ Check application logs for:
 - Track error rates
 - Monitor database performance
 - Set up alerts for critical issues
-```
