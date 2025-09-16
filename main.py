@@ -28,7 +28,6 @@ os.makedirs(app.config['UPLOAD_FOLDER'], exist_ok=True)
 JSONResponse = Tuple[Dict[str, Any], int]
 
 def rate_limit(f):
-    """Decorator to implement rate limiting."""
     @wraps(f)
     def decorated_function(*args, **kwargs):
         client_ip = request.remote_addr
@@ -56,13 +55,11 @@ def rate_limit(f):
     return decorated_function
 
 def get_db_connection() -> sqlite3.Connection:
-    """Create and return a database connection."""
     conn = sqlite3.connect(app.config['DATABASE'])
     conn.row_factory = sqlite3.Row
     return conn
 
 def init_db() -> None:
-    """Initialize the database with required tables."""
     if not os.path.exists(app.config['DATABASE']):
         conn = get_db_connection()
         cursor = conn.cursor()
@@ -70,11 +67,11 @@ def init_db() -> None:
         cursor.execute('''
             CREATE TABLE users (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
-                username TEXT UNIQUE NOT NULL,
+                username TEXT UNIQUE,
                 password_hash TEXT NOT NULL,
                 first_name TEXT NOT NULL,
                 last_name TEXT,
-                phone TEXT,
+                phone_number TEXT,
                 is_bot BOOLEAN DEFAULT FALSE,
                 token TEXT UNIQUE,
                 created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
@@ -100,6 +97,7 @@ def init_db() -> None:
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 type TEXT NOT NULL CHECK(type IN ('private', 'group', 'channel', 'supergroup')),
                 title TEXT,
+                username TEXT UNIQUE,
                 description TEXT,
                 invite_link TEXT UNIQUE,
                 created_by INTEGER,
@@ -117,6 +115,7 @@ def init_db() -> None:
                 status TEXT DEFAULT 'member' CHECK(status IN (
                     'creator', 'administrator', 'member', 'restricted', 'left', 'kicked'
                 )),
+                custom_title TEXT,
                 until_date TIMESTAMP NULL,
                 can_send_messages BOOLEAN DEFAULT TRUE,
                 can_send_media_messages BOOLEAN DEFAULT TRUE,
@@ -142,13 +141,17 @@ def init_db() -> None:
                 message_id INTEGER NOT NULL,
                 date TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                 edit_date TIMESTAMP NULL,
-                media_type TEXT CHECK(media_type IN (
-                    'text', 'photo', 'document', 'video', 'audio', 'voice', 'sticker', 'location', 'contact'
+                message_type TEXT DEFAULT 'text' CHECK(message_type IN (
+                    'text', 'photo', 'document', 'video', 'audio', 'voice',
+                    'sticker', 'animation', 'location', 'contact', 'poll', 'dice'
                 )),
-                media_caption TEXT,
+                caption TEXT,
                 file_id TEXT,
                 file_size INTEGER,
                 mime_type TEXT,
+                duration INTEGER,
+                width INTEGER,
+                height INTEGER,
                 reply_to_message_id INTEGER,
                 is_pinned BOOLEAN DEFAULT FALSE,
                 views INTEGER DEFAULT 0,
@@ -177,7 +180,7 @@ def init_db() -> None:
                 contact_user_id INTEGER NOT NULL,
                 first_name TEXT,
                 last_name TEXT,
-                phone TEXT,
+                phone_number TEXT,
                 created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                 UNIQUE(user_id, contact_user_id),
                 FOREIGN KEY (user_id) REFERENCES users (id) ON DELETE CASCADE,
@@ -308,12 +311,24 @@ def init_db() -> None:
             )
         ''')
 
+        cursor.execute('''
+            CREATE TABLE message_views (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                message_id INTEGER NOT NULL,
+                user_id INTEGER NOT NULL,
+                viewed_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                view_count INTEGER DEFAULT 1,
+                UNIQUE(message_id, user_id),
+                FOREIGN KEY (message_id) REFERENCES messages (id) ON DELETE CASCADE,
+                FOREIGN KEY (user_id) REFERENCES users (id) ON DELETE CASCADE
+            )
+        ''')
+
         conn.commit()
         conn.close()
         logger.info("Database created successfully!")
 
 def authenticate_token(token: str) -> Optional[sqlite3.Row]:
-    """Authenticate user by token and update last seen."""
     conn = get_db_connection()
     user = conn.execute(
         'SELECT * FROM users WHERE token = ?',
@@ -330,31 +345,7 @@ def authenticate_token(token: str) -> Optional[sqlite3.Row]:
     conn.close()
     return user
 
-def token_required(f):
-    """Decorator to require token authentication for API methods."""
-    @wraps(f)
-    def decorated_function(*args, **kwargs):
-        token = kwargs.get('token')
-        if not token:
-            return jsonify({
-                'ok': False,
-                'error_code': 401,
-                'description': 'Token is required'
-            }), 401
-
-        user = authenticate_token(token)
-        if not user:
-            return jsonify({
-                'ok': False,
-                'error_code': 401,
-                'description': 'Unauthorized: Invalid token'
-            }), 401
-
-        return f(user, *args, **kwargs)
-    return decorated_function
-
 def validate_json(schema: Dict[str, Any]):
-    """Decorator to validate JSON input against a schema."""
     def decorator(f):
         @wraps(f)
         def decorated_function(*args, **kwargs):
@@ -366,8 +357,14 @@ def validate_json(schema: Dict[str, Any]):
                 }), 400
 
             data = request.get_json()
-            errors = {}
+            if data is None:
+                return jsonify({
+                    'ok': False,
+                    'error_code': 400,
+                    'description': 'Invalid JSON format'
+                }), 400
 
+            errors = {}
             for field, field_type in schema.items():
                 if field not in data:
                     errors[field] = 'This field is required'
@@ -386,15 +383,19 @@ def validate_json(schema: Dict[str, Any]):
         return decorated_function
     return decorator
 
-
 @app.route('/api/bot<token>/<method>', methods=['GET', 'POST'])
 @rate_limit
 def api_method(token: str, method: str) -> JSONResponse:
-    """Main API endpoint router."""
     method_handlers = {
         'getMe': get_me,
         'getMessages': get_messages,
         'getChat': get_chat,
+        'getRecentChats': get_recent_chats,
+        'getMyChats': get_my_chats,
+        'getPrivateChats': get_private_chats,
+        'getGroupChats': get_group_chats,
+        'getSupergroupChats': get_supergroup_chats,
+        'getChannelChats': get_channel_chats,
         'getUpdates': get_updates,
         'getContacts': get_contacts,
         'addContact': add_contact,
@@ -414,8 +415,6 @@ def api_method(token: str, method: str) -> JSONResponse:
         'fetchMessages': fetch_messages,
         'logout': logout,
         'close': close,
-        'signin': sign_in,
-        'signup': sign_up,
         'connect': connect,
         'disconnect': disconnect,
         'refresh': refresh,
@@ -441,6 +440,8 @@ def api_method(token: str, method: str) -> JSONResponse:
         'sendAudio': send_audio,
         'sendVideo': send_video,
         'sendVoice': send_voice,
+        'sendAnimation': send_animation,
+        'sendSticker': send_sticker,
         'sendLocation': send_location,
         'sendContact': send_contact,
         'sendPoll': send_poll,
@@ -461,8 +462,18 @@ def api_method(token: str, method: str) -> JSONResponse:
         'getUserStatistics': get_user_statistics,
         'setMemberCustomTitle': set_member_custom_title,
         'viewMessage': view_message,
+        'getMessageViewsCount': get_message_views_count,
+        'getMessageViewers': get_message_viewers,
+        'getUserMessageViews': get_user_message_views,
         'getChatActivityStats': get_chat_activity_stats,
     }
+
+    if method in ['signin', 'signup']:
+        return jsonify({
+            'ok': False,
+            'error_code': 404,
+            'description': 'Method not found. Use /api/bot/signin or /api/bot/signup instead'
+        }), 404
 
     handler = method_handlers.get(method)
     if not handler:
@@ -472,17 +483,32 @@ def api_method(token: str, method: str) -> JSONResponse:
             'description': 'Method not found'
         }), 404
 
-    if method in ['signin', 'signup']:
-        return handler(request)
-    else:
-        return handler(token)
+    user = authenticate_token(token)
+    if not user:
+        return jsonify({
+            'ok': False,
+            'error_code': 401,
+            'description': 'Unauthorized: Invalid token'
+        }), 401
+
+    return handler(user)
+
+@app.route('/api/bot/signin', methods=['POST'])
+@rate_limit
+def api_signin() -> JSONResponse:
+    return sign_in(request)
+
+@app.route('/api/bot/signup', methods=['POST'])
+@rate_limit
+def api_signup() -> JSONResponse:
+    return sign_up(request)
 
 @rate_limit
 @validate_json({'username': str, 'password': str})
 def sign_in(request) -> JSONResponse:
-    """Authenticate user and return token."""
-    username = request.json['username']
-    password = request.json['password']
+    data = request.get_json()
+    username = data['username']
+    password = data['password']
 
     conn = get_db_connection()
     user = conn.execute(
@@ -495,29 +521,37 @@ def sign_in(request) -> JSONResponse:
         return jsonify({
             'ok': False,
             'error_code': 401,
-            'description': 'Invalid credentials'
+            'description': 'Invalid username or password'
         }), 401
 
-    token = str(uuid.uuid4())
-    conn.execute(
-        'UPDATE users SET token = ?, last_seen = CURRENT_TIMESTAMP WHERE id = ?',
-        (token, user['id'])
-    )
-    conn.commit()
+    if not user['token']:
+        new_token = str(uuid.uuid4())
+        conn.execute(
+            'UPDATE users SET token = ? WHERE id = ?',
+            (new_token, user['id'])
+        )
+        conn.commit()
+        user = conn.execute(
+            'SELECT * FROM users WHERE id = ?',
+            (user['id'],)
+        ).fetchone()
+
     conn.close()
 
     return jsonify({
         'ok': True,
         'result': {
-            'token': token,
             'user': {
                 'id': user['id'],
                 'username': user['username'],
                 'first_name': user['first_name'],
                 'last_name': user['last_name'],
-                'phone': user['phone'],
-                'is_bot': bool(user['is_bot'])
-            }
+                'phone_number': user['phone_number'],
+                'is_bot': bool(user['is_bot']),
+                'is_online': bool(user['is_online']),
+                'last_seen': user['last_seen']
+            },
+            'token': user['token']
         }
     })
 
@@ -525,115 +559,3697 @@ def sign_in(request) -> JSONResponse:
 @validate_json({
     'username': str,
     'password': str,
-    'first_name': str
+    'first_name': str,
+    'last_name': str,
+    'phone_number': str
 })
 def sign_up(request) -> JSONResponse:
-    """Register a new user."""
-    username = request.json['username']
-    password = request.json['password']
-    first_name = request.json['first_name']
-    last_name = request.json.get('last_name', '')
-    phone = request.json.get('phone', '')
-
-    if not username.isalnum() or len(username) < 3:
-        return jsonify({
-            'ok': False,
-            'error_code': 400,
-            'description': 'Username must be alphanumeric and at least 3 characters long'
-        }), 400
-
-    if len(password) < 6:
-        return jsonify({
-            'ok': False,
-            'error_code': 400,
-            'description': 'Password must be at least 6 characters long'
-        }), 400
+    data = request.get_json()
+    username = data['username']
+    password = data['password']
+    first_name = data['first_name']
+    last_name = data.get('last_name', '')
+    phone_number = data['phone_number']
 
     conn = get_db_connection()
 
     existing_user = conn.execute(
-        'SELECT id FROM users WHERE username = ?',
-        (username,)
+        'SELECT id FROM users WHERE username = ? OR phone_number = ?',
+        (username, phone_number)
     ).fetchone()
 
     if existing_user:
         conn.close()
         return jsonify({
             'ok': False,
-            'error_code': 400,
-            'description': 'Username already exists'
-        }), 400
+            'error_code': 409,
+            'description': 'Username or phone number already exists'
+        }), 409
 
     password_hash = generate_password_hash(password)
     token = str(uuid.uuid4())
 
-    conn.execute('''
-        INSERT INTO users (username, password_hash, first_name, last_name, phone, token)
-        VALUES (?, ?, ?, ?, ?, ?)
-    ''', (username, password_hash, first_name, last_name, phone, token))
+    try:
+        cursor = conn.cursor()
+        cursor.execute(
+            '''INSERT INTO users
+            (username, password_hash, first_name, last_name, phone_number, token)
+            VALUES (?, ?, ?, ?, ?, ?)''',
+            (username, password_hash, first_name, last_name, phone_number, token)
+        )
+        user_id = cursor.lastrowid
 
-    user_id = conn.execute('SELECT last_insert_rowid()').fetchone()[0]
+        cursor.execute(
+            'INSERT INTO user_settings (user_id) VALUES (?)',
+            (user_id,)
+        )
 
-    conn.execute('''
-        INSERT INTO user_settings (user_id)
-        VALUES (?)
-    ''', (user_id,))
+        cursor.execute(
+            'INSERT INTO user_stats (user_id) VALUES (?)',
+            (user_id,)
+        )
 
-    conn.commit()
-    conn.close()
+        conn.commit()
 
-    return jsonify({
-        'ok': True,
-        'result': {
-            'token': token,
-            'user': {
-                'id': user_id,
-                'username': username,
-                'first_name': first_name,
-                'last_name': last_name,
-                'phone': phone,
-                'is_bot': False
+        user = conn.execute(
+            'SELECT * FROM users WHERE id = ?',
+            (user_id,)
+        ).fetchone()
+
+        conn.close()
+
+        return jsonify({
+            'ok': True,
+            'result': {
+                'user': {
+                    'id': user['id'],
+                    'username': user['username'],
+                    'first_name': user['first_name'],
+                    'last_name': user['last_name'],
+                    'phone_number': user['phone_number'],
+                    'is_bot': bool(user['is_bot']),
+                    'is_online': bool(user['is_online']),
+                    'last_seen': user['last_seen']
+                },
+                'token': user['token']
             }
-        }
-    })
+        })
 
-@token_required
-def logout(user: sqlite3.Row) -> JSONResponse:
-    """Log out user by invalidating token."""
-    conn = get_db_connection()
-    conn.execute(
-        'UPDATE users SET token = NULL WHERE id = ?',
-        (user['id'],)
-    )
-    conn.commit()
-    conn.close()
+    except sqlite3.Error as e:
+        conn.close()
+        return jsonify({
+            'ok': False,
+            'error_code': 500,
+            'description': f'Database error: {str(e)}'
+        }), 500
 
-    return jsonify({
-        'ok': True,
-        'result': 'Logged out successfully'
-    })
-
-@token_required
 def get_me(user: sqlite3.Row) -> JSONResponse:
-    """Get current user information."""
     return jsonify({
         'ok': True,
         'result': {
             'id': user['id'],
-            'is_bot': bool(user['is_bot']),
+            'username': user['username'],
             'first_name': user['first_name'],
             'last_name': user['last_name'],
-            'username': user['username'],
-            'phone': user['phone'],
+            'phone_number': user['phone_number'],
+            'is_bot': bool(user['is_bot']),
             'is_online': bool(user['is_online']),
             'last_seen': user['last_seen']
         }
     })
 
-@token_required
+def get_messages(user: sqlite3.Row) -> JSONResponse:
+    chat_id = request.args.get('chat_id', type=int)
+    limit = request.args.get('limit', 50, type=int)
+    offset = request.args.get('offset', 0, type=int)
+
+    if not chat_id:
+        return jsonify({
+            'ok': False,
+            'error_code': 400,
+            'description': 'chat_id parameter is required'
+        }), 400
+
+    conn = get_db_connection()
+
+    is_member = conn.execute(
+        'SELECT 1 FROM chat_members WHERE chat_id = ? AND user_id = ?',
+        (chat_id, user['id'])
+    ).fetchone()
+
+    if not is_member:
+        conn.close()
+        return jsonify({
+            'ok': False,
+            'error_code': 403,
+            'description': 'You are not a member of this chat'
+        }), 403
+
+    messages = conn.execute('''
+        SELECT m.*, u.username, u.first_name, u.last_name
+        FROM messages m
+        JOIN users u ON m.from_user_id = u.id
+        WHERE m.chat_id = ?
+        ORDER BY m.date DESC
+        LIMIT ? OFFSET ?
+    ''', (chat_id, limit, offset)).fetchall()
+
+    result = []
+    for msg in messages:
+        message_data = {
+            'message_id': msg['message_id'],
+            'from': {
+                'id': msg['from_user_id'],
+                'username': msg['username'],
+                'first_name': msg['first_name'],
+                'last_name': msg['last_name']
+            },
+            'chat': {'id': msg['chat_id']},
+            'date': msg['date'],
+            'text': msg['text'],
+            'message_type': msg['message_type'],
+            'caption': msg['caption'],
+            'file_id': msg['file_id'],
+            'file_size': msg['file_size'],
+            'mime_type': msg['mime_type'],
+            'duration': msg['duration'],
+            'width': msg['width'],
+            'height': msg['height'],
+            'reply_to_message_id': msg['reply_to_message_id'],
+            'is_pinned': bool(msg['is_pinned']),
+            'views': msg['views']
+        }
+        result.append(message_data)
+
+    conn.close()
+    return jsonify({'ok': True, 'result': result})
+
+def get_chat(user: sqlite3.Row) -> JSONResponse:
+    chat_id = request.args.get('chat_id', type=int)
+
+    if not chat_id:
+        return jsonify({
+            'ok': False,
+            'error_code': 400,
+            'description': 'chat_id parameter is required'
+        }), 400
+
+    conn = get_db_connection()
+
+    chat = conn.execute(
+        'SELECT * FROM chats WHERE id = ?',
+        (chat_id,)
+    ).fetchone()
+
+    if not chat:
+        conn.close()
+        return jsonify({
+            'ok': False,
+            'error_code': 404,
+            'description': 'Chat not found'
+        }), 404
+
+    is_member = conn.execute(
+        'SELECT 1 FROM chat_members WHERE chat_id = ? AND user_id = ?',
+        (chat_id, user['id'])
+    ).fetchone()
+
+    if not is_member:
+        conn.close()
+        return jsonify({
+            'ok': False,
+            'error_code': 403,
+            'description': 'You are not a member of this chat'
+        }), 403
+
+    members_count = conn.execute(
+        'SELECT COUNT(*) as count FROM chat_members WHERE chat_id = ?',
+        (chat_id,)
+    ).fetchone()['count']
+
+    chat_data = {
+        'id': chat['id'],
+        'type': chat['type'],
+        'title': chat['title'],
+        'username': chat['username'],
+        'description': chat['description'],
+        'invite_link': chat['invite_link'],
+        'is_public': bool(chat['is_public']),
+        'members_count': members_count,
+        'created_at': chat['created_at']
+    }
+
+    conn.close()
+    return jsonify({'ok': True, 'result': chat_data})
+
+def get_my_chats(user: sqlite3.Row) -> JSONResponse:
+    """Get all chats where user is a member and has sent messages"""
+    conn = get_db_connection()
+
+    try:
+        chats = conn.execute('''
+            SELECT DISTINCT c.*,
+                   (SELECT COUNT(*) FROM messages m WHERE m.chat_id = c.id) as message_count,
+                   (SELECT COUNT(*) FROM chat_members cm WHERE cm.chat_id = c.id) as members_count,
+                   (SELECT MAX(date) FROM messages m WHERE m.chat_id = c.id) as last_activity
+            FROM chats c
+            JOIN chat_members cm ON c.id = cm.chat_id
+            JOIN messages m ON c.id = m.chat_id
+            WHERE cm.user_id = ? AND m.from_user_id = ?
+            ORDER BY last_activity DESC
+        ''', (user['id'], user['id'])).fetchall()
+
+        result = []
+        for chat in chats:
+            chat_data = {
+                'id': chat['id'],
+                'type': chat['type'],
+                'title': chat['title'],
+                'username': chat['username'],
+                'description': chat['description'],
+                'invite_link': chat['invite_link'],
+                'is_public': bool(chat['is_public']),
+                'created_at': chat['created_at'],
+                'message_count': chat['message_count'],
+                'members_count': chat['members_count'],
+                'last_activity': chat['last_activity']
+            }
+            result.append(chat_data)
+
+        return jsonify({'ok': True, 'result': result})
+
+    except sqlite3.Error as e:
+        return jsonify({
+            'ok': False,
+            'error_code': 500,
+            'description': f'Database error: {str(e)}'
+        }), 500
+    finally:
+        conn.close()
+
+def get_private_chats(user: sqlite3.Row) -> JSONResponse:
+    """Get all private chats where user has sent messages"""
+    conn = get_db_connection()
+
+    try:
+        chats = conn.execute('''
+            SELECT DISTINCT c.*,
+                   u.username as partner_username,
+                   u.first_name as partner_first_name,
+                   u.last_name as partner_last_name,
+                   (SELECT COUNT(*) FROM messages m WHERE m.chat_id = c.id) as message_count,
+                   (SELECT MAX(date) FROM messages m WHERE m.chat_id = c.id) as last_activity
+            FROM chats c
+            JOIN chat_members cm ON c.id = cm.chat_id
+            JOIN messages m ON c.id = m.chat_id
+            JOIN chat_members cm2 ON c.id = cm2.chat_id AND cm2.user_id != ?
+            JOIN users u ON cm2.user_id = u.id
+            WHERE c.type = 'private'
+            AND cm.user_id = ?
+            AND m.from_user_id = ?
+            ORDER BY last_activity DESC
+        ''', (user['id'], user['id'], user['id'])).fetchall()
+
+        result = []
+        for chat in chats:
+            chat_data = {
+                'id': chat['id'],
+                'type': chat['type'],
+                'title': chat['title'] or f"{chat['partner_first_name']} {chat['partner_last_name']}",
+                'partner': {
+                    'id': chat['partner_username'],
+                    'username': chat['partner_username'],
+                    'first_name': chat['partner_first_name'],
+                    'last_name': chat['partner_last_name']
+                },
+                'message_count': chat['message_count'],
+                'last_activity': chat['last_activity']
+            }
+            result.append(chat_data)
+
+        return jsonify({'ok': True, 'result': result})
+
+    except sqlite3.Error as e:
+        return jsonify({
+            'ok': False,
+            'error_code': 500,
+            'description': f'Database error: {str(e)}'
+        }), 500
+    finally:
+        conn.close()
+
+def get_group_chats(user: sqlite3.Row) -> JSONResponse:
+    """Get all group chats where user is a member and has sent messages"""
+    return get_chats_by_type(user, 'group')
+
+def get_supergroup_chats(user: sqlite3.Row) -> JSONResponse:
+    """Get all supergroup chats where user is a member and has sent messages"""
+    return get_chats_by_type(user, 'supergroup')
+
+def get_channel_chats(user: sqlite3.Row) -> JSONResponse:
+    """Get all channel chats where user is a member and has sent messages"""
+    return get_chats_by_type(user, 'channel')
+
+def get_chats_by_type(user: sqlite3.Row, chat_type: str) -> JSONResponse:
+    """Helper function to get chats by specific type"""
+    conn = get_db_connection()
+
+    try:
+        chats = conn.execute('''
+            SELECT DISTINCT c.*,
+                   (SELECT COUNT(*) FROM messages m WHERE m.chat_id = c.id) as message_count,
+                   (SELECT COUNT(*) FROM chat_members cm WHERE cm.chat_id = c.id) as members_count,
+                   (SELECT MAX(date) FROM messages m WHERE m.chat_id = c.id) as last_activity
+            FROM chats c
+            JOIN chat_members cm ON c.id = cm.chat_id
+            JOIN messages m ON c.id = m.chat_id
+            WHERE c.type = ?
+            AND cm.user_id = ?
+            AND m.from_user_id = ?
+            ORDER BY last_activity DESC
+        ''', (chat_type, user['id'], user['id'])).fetchall()
+
+        result = []
+        for chat in chats:
+            chat_data = {
+                'id': chat['id'],
+                'type': chat['type'],
+                'title': chat['title'],
+                'username': chat['username'],
+                'description': chat['description'],
+                'invite_link': chat['invite_link'],
+                'is_public': bool(chat['is_public']),
+                'created_at': chat['created_at'],
+                'message_count': chat['message_count'],
+                'members_count': chat['members_count'],
+                'last_activity': chat['last_activity']
+            }
+            result.append(chat_data)
+
+        return jsonify({'ok': True, 'result': result})
+
+    except sqlite3.Error as e:
+        return jsonify({
+            'ok': False,
+            'error_code': 500,
+            'description': f'Database error: {str(e)}'
+        }), 500
+    finally:
+        conn.close()
+
+def get_recent_chats(user: sqlite3.Row) -> JSONResponse:
+    """Get recent chats with activity"""
+    limit = request.args.get('limit', 20, type=int)
+
+    conn = get_db_connection()
+
+    try:
+        chats = conn.execute('''
+            SELECT c.*,
+                   MAX(m.date) as last_activity,
+                   (SELECT COUNT(*) FROM messages m2 WHERE m2.chat_id = c.id) as message_count,
+                   (SELECT text FROM messages m3 WHERE m3.chat_id = c.id ORDER BY m3.date DESC LIMIT 1) as last_message
+            FROM chats c
+            JOIN chat_members cm ON c.id = cm.chat_id
+            JOIN messages m ON c.id = m.chat_id
+            WHERE cm.user_id = ?
+            GROUP BY c.id
+            ORDER BY last_activity DESC
+            LIMIT ?
+        ''', (user['id'], limit)).fetchall()
+
+        result = []
+        for chat in chats:
+            chat_data = {
+                'id': chat['id'],
+                'type': chat['type'],
+                'title': chat['title'],
+                'username': chat['username'],
+                'last_activity': chat['last_activity'],
+                'message_count': chat['message_count'],
+                'last_message': chat['last_message']
+            }
+            result.append(chat_data)
+
+        return jsonify({'ok': True, 'result': result})
+
+    except sqlite3.Error as e:
+        return jsonify({
+            'ok': False,
+            'error_code': 500,
+            'description': f'Database error: {str(e)}'
+        }), 500
+    finally:
+        conn.close()
+
+def get_updates(user: sqlite3.Row) -> JSONResponse:
+    offset = request.args.get('offset', 0, type=int)
+    limit = request.args.get('limit', 100, type=int)
+    timeout = request.args.get('timeout', 30, type=int)
+
+    conn = get_db_connection()
+
+    updates = conn.execute('''
+        SELECT m.*, u.username, u.first_name, u.last_name, c.type as chat_type, c.title as chat_title
+        FROM messages m
+        JOIN users u ON m.from_user_id = u.id
+        JOIN chats c ON m.chat_id = c.id
+        JOIN chat_members cm ON m.chat_id = cm.chat_id AND cm.user_id = ?
+        WHERE m.id > ?
+        ORDER BY m.date ASC
+        LIMIT ?
+    ''', (user['id'], offset, limit)).fetchall()
+
+    result = []
+    for msg in updates:
+        update_data = {
+            'update_id': msg['id'],
+            'message': {
+                'message_id': msg['message_id'],
+                'from': {
+                    'id': msg['from_user_id'],
+                    'username': msg['username'],
+                    'first_name': msg['first_name'],
+                    'last_name': msg['last_name']
+                },
+                'chat': {
+                    'id': msg['chat_id'],
+                    'type': msg['chat_type'],
+                    'title': msg['chat_title']
+                },
+                'date': msg['date'],
+                'text': msg['text'],
+                'message_type': msg['message_type'],
+                'caption': msg['caption'],
+                'file_id': msg['file_id']
+            }
+        }
+        result.append(update_data)
+
+    conn.close()
+    return jsonify({'ok': True, 'result': result})
+
+def get_contacts(user: sqlite3.Row) -> JSONResponse:
+    conn = get_db_connection()
+
+    contacts = conn.execute('''
+        SELECT u.id, u.username, u.first_name, u.last_name, u.phone_number, u.is_online, u.last_seen
+        FROM contacts c
+        JOIN users u ON c.contact_user_id = u.id
+        WHERE c.user_id = ?
+        ORDER BY u.first_name, u.last_name
+    ''', (user['id'],)).fetchall()
+
+    result = []
+    for contact in contacts:
+        contact_data = {
+            'id': contact['id'],
+            'username': contact['username'],
+            'first_name': contact['first_name'],
+            'last_name': contact['last_name'],
+            'phone_number': contact['phone_number'],
+            'is_online': bool(contact['is_online']),
+            'last_seen': contact['last_seen']
+        }
+        result.append(contact_data)
+
+    conn.close()
+    return jsonify({'ok': True, 'result': result})
+
+@validate_json({'user_id': int, 'first_name': str, 'last_name': str, 'phone_number': str})
+def add_contact(user: sqlite3.Row) -> JSONResponse:
+    data = request.get_json()
+    contact_user_id = data['user_id']
+    first_name = data['first_name']
+    last_name = data['last_name']
+    phone_number = data['phone_number']
+
+    if contact_user_id == user['id']:
+        return jsonify({
+            'ok': False,
+            'error_code': 400,
+            'description': 'Cannot add yourself as contact'
+        }), 400
+
+    conn = get_db_connection()
+
+    contact_user = conn.execute(
+        'SELECT id FROM users WHERE id = ?',
+        (contact_user_id,)
+    ).fetchone()
+
+    if not contact_user:
+        conn.close()
+        return jsonify({
+            'ok': False,
+            'error_code': 404,
+            'description': 'User not found'
+        }), 404
+
+    existing_contact = conn.execute(
+        'SELECT id FROM contacts WHERE user_id = ? AND contact_user_id = ?',
+        (user['id'], contact_user_id)
+    ).fetchone()
+
+    if existing_contact:
+        conn.close()
+        return jsonify({
+            'ok': False,
+            'error_code': 409,
+            'description': 'Contact already exists'
+        }), 409
+
+    try:
+        conn.execute(
+            '''INSERT INTO contacts
+            (user_id, contact_user_id, first_name, last_name, phone_number)
+            VALUES (?, ?, ?, ?, ?)''',
+            (user['id'], contact_user_id, first_name, last_name, phone_number)
+        )
+        conn.commit()
+        conn.close()
+
+        return jsonify({
+            'ok': True,
+            'result': {
+                'success': True,
+                'description': 'Contact added successfully'
+            }
+        })
+
+    except sqlite3.Error as e:
+        conn.close()
+        return jsonify({
+            'ok': False,
+            'error_code': 500,
+            'description': f'Database error: {str(e)}'
+        }), 500
+
+@validate_json({'chat_id': int, 'text': str})
+def send_message(user: sqlite3.Row) -> JSONResponse:
+    data = request.get_json()
+    chat_id = data['chat_id']
+    text = data['text']
+    reply_to_message_id = data.get('reply_to_message_id')
+
+    conn = get_db_connection()
+
+    is_member = conn.execute(
+        'SELECT 1 FROM chat_members WHERE chat_id = ? AND user_id = ?',
+        (chat_id, user['id'])
+    ).fetchone()
+
+    if not is_member:
+        conn.close()
+        return jsonify({
+            'ok': False,
+            'error_code': 403,
+            'description': 'You are not a member of this chat'
+        }), 403
+
+    if reply_to_message_id:
+        replied_message = conn.execute(
+            'SELECT id FROM messages WHERE chat_id = ? AND message_id = ?',
+            (chat_id, reply_to_message_id)
+        ).fetchone()
+        if not replied_message:
+            conn.close()
+            return jsonify({
+                'ok': False,
+                'error_code': 404,
+                'description': 'Replied message not found'
+            }), 404
+
+    try:
+        max_message_id = conn.execute(
+            'SELECT COALESCE(MAX(message_id), 0) as max_id FROM messages WHERE chat_id = ?',
+            (chat_id,)
+        ).fetchone()['max_id']
+        new_message_id = max_message_id + 1
+
+        cursor = conn.cursor()
+        cursor.execute(
+            '''INSERT INTO messages
+            (chat_id, from_user_id, text, message_id, reply_to_message_id)
+            VALUES (?, ?, ?, ?, ?)''',
+            (chat_id, user['id'], text, new_message_id, reply_to_message_id)
+        )
+
+        message_id = cursor.lastrowid
+
+        conn.commit()
+
+        message = conn.execute('''
+            SELECT m.*, u.username, u.first_name, u.last_name
+            FROM messages m
+            JOIN users u ON m.from_user_id = u.id
+            WHERE m.id = ?
+        ''', (message_id,)).fetchone()
+
+        conn.close()
+
+        message_data = {
+            'message_id': message['message_id'],
+            'from': {
+                'id': message['from_user_id'],
+                'username': message['username'],
+                'first_name': message['first_name'],
+                'last_name': message['last_name']
+            },
+            'chat': {'id': chat_id},
+            'date': message['date'],
+            'text': message['text'],
+            'reply_to_message_id': message['reply_to_message_id']
+        }
+
+        return jsonify({'ok': True, 'result': message_data})
+
+    except sqlite3.Error as e:
+        conn.close()
+        return jsonify({
+            'ok': False,
+            'error_code': 500,
+            'description': f'Database error: {str(e)}'
+        }), 500
+
+@validate_json({'chat_id': int, 'message_id': int, 'text': str})
+def edit_message_text(user: sqlite3.Row) -> JSONResponse:
+    data = request.get_json()
+    chat_id = data['chat_id']
+    message_id = data['message_id']
+    text = data['text']
+
+    conn = get_db_connection()
+
+    message = conn.execute(
+        'SELECT * FROM messages WHERE chat_id = ? AND message_id = ? AND from_user_id = ?',
+        (chat_id, message_id, user['id'])
+    ).fetchone()
+
+    if not message:
+        conn.close()
+        return jsonify({
+            'ok': False,
+            'error_code': 404,
+            'description': 'Message not found or you are not the author'
+        }), 404
+
+    try:
+        conn.execute(
+            'UPDATE messages SET text = ?, edit_date = CURRENT_TIMESTAMP WHERE id = ?',
+            (text, message['id'])
+        )
+        conn.commit()
+
+        updated_message = conn.execute('''
+            SELECT m.*, u.username, u.first_name, u.last_name
+            FROM messages m
+            JOIN users u ON m.from_user_id = u.id
+            WHERE m.id = ?
+        ''', (message['id'],)).fetchone()
+
+        conn.close()
+
+        message_data = {
+            'message_id': updated_message['message_id'],
+            'from': {
+                'id': updated_message['from_user_id'],
+                'username': updated_message['username'],
+                'first_name': updated_message['first_name'],
+                'last_name': updated_message['last_name']
+            },
+            'chat': {'id': chat_id},
+            'date': updated_message['date'],
+            'edit_date': updated_message['edit_date'],
+            'text': updated_message['text']
+        }
+
+        return jsonify({'ok': True, 'result': message_data})
+
+    except sqlite3.Error as e:
+        conn.close()
+        return jsonify({
+            'ok': False,
+            'error_code': 500,
+            'description': f'Database error: {str(e)}'
+        }), 500
+
+@validate_json({'chat_id': int, 'message_id': int})
+def delete_message(user: sqlite3.Row) -> JSONResponse:
+    data = request.get_json()
+    chat_id = data['chat_id']
+    message_id = data['message_id']
+
+    conn = get_db_connection()
+
+    message = conn.execute(
+        'SELECT * FROM messages WHERE chat_id = ? AND message_id = ?',
+        (chat_id, message_id)
+    ).fetchone()
+
+    if not message:
+        conn.close()
+        return jsonify({
+            'ok': False,
+            'error_code': 404,
+            'description': 'Message not found'
+        }), 404
+
+    is_admin = conn.execute('''
+        SELECT 1 FROM chat_members
+        WHERE chat_id = ? AND user_id = ?
+        AND status IN ('creator', 'administrator')
+    ''', (chat_id, user['id'])).fetchone()
+
+    if message['from_user_id'] != user['id'] and not is_admin:
+        conn.close()
+        return jsonify({
+            'ok': False,
+            'error_code': 403,
+            'description': 'You can only delete your own messages'
+        }), 403
+
+    try:
+        conn.execute(
+            'DELETE FROM messages WHERE id = ?',
+            (message['id'],)
+        )
+        conn.commit()
+        conn.close()
+
+        return jsonify({
+            'ok': True,
+            'result': {
+                'success': True,
+                'description': 'Message deleted successfully'
+            }
+        })
+
+    except sqlite3.Error as e:
+        conn.close()
+        return jsonify({
+            'ok': False,
+            'error_code': 500,
+            'description': f'Database error: {str(e)}'
+        }), 500
+
+@validate_json({'chat_id': int, 'message_id': int, 'caption': str})
+def edit_message_caption(user: sqlite3.Row) -> JSONResponse:
+    data = request.get_json()
+    chat_id = data['chat_id']
+    message_id = data['message_id']
+    caption = data['caption']
+
+    conn = get_db_connection()
+
+    message = conn.execute(
+        'SELECT * FROM messages WHERE chat_id = ? AND message_id = ? AND from_user_id = ?',
+        (chat_id, message_id, user['id'])
+    ).fetchone()
+
+    if not message:
+        conn.close()
+        return jsonify({
+            'ok': False,
+            'error_code': 404,
+            'description': 'Message not found or you are not the author'
+        }), 404
+
+    if message['message_type'] == 'text':
+        conn.close()
+        return jsonify({
+            'ok': False,
+            'error_code': 400,
+            'description': 'Text messages do not have captions'
+        }), 400
+
+    try:
+        conn.execute(
+            'UPDATE messages SET caption = ?, edit_date = CURRENT_TIMESTAMP WHERE id = ?',
+            (caption, message['id'])
+        )
+        conn.commit()
+
+        updated_message = conn.execute('''
+            SELECT m.*, u.username, u.first_name, u.last_name
+            FROM messages m
+            JOIN users u ON m.from_user_id = u.id
+            WHERE m.id = ?
+        ''', (message['id'],)).fetchone()
+
+        conn.close()
+
+        message_data = {
+            'message_id': updated_message['message_id'],
+            'from': {
+                'id': updated_message['from_user_id'],
+                'username': updated_message['username'],
+                'first_name': updated_message['first_name'],
+                'last_name': updated_message['last_name']
+            },
+            'chat': {'id': chat_id},
+            'date': updated_message['date'],
+            'edit_date': updated_message['edit_date'],
+            'message_type': updated_message['message_type'],
+            'caption': updated_message['caption'],
+            'file_id': updated_message['file_id']
+        }
+
+        return jsonify({'ok': True, 'result': message_data})
+
+    except sqlite3.Error as e:
+        conn.close()
+        return jsonify({
+            'ok': False,
+            'error_code': 500,
+            'description': f'Database error: {str(e)}'
+        }), 500
+
+@validate_json({'chat_id': int})
+def join_chat(user: sqlite3.Row) -> JSONResponse:
+    data = request.get_json()
+    chat_id = data['chat_id']
+
+    conn = get_db_connection()
+
+    chat = conn.execute(
+        'SELECT * FROM chats WHERE id = ?',
+        (chat_id,)
+    ).fetchone()
+
+    if not chat:
+        conn.close()
+        return jsonify({
+            'ok': False,
+            'error_code': 404,
+            'description': 'Chat not found'
+        }), 404
+
+    existing_member = conn.execute(
+        'SELECT id FROM chat_members WHERE chat_id = ? AND user_id = ?',
+        (chat_id, user['id'])
+    ).fetchone()
+
+    if existing_member:
+        conn.close()
+        return jsonify({
+            'ok': False,
+            'error_code': 409,
+            'description': 'Already a member of this chat'
+        }), 409
+
+    try:
+        conn.execute(
+            'INSERT INTO chat_members (chat_id, user_id) VALUES (?, ?)',
+            (chat_id, user['id'])
+        )
+        conn.commit()
+        conn.close()
+
+        return jsonify({
+            'ok': True,
+            'result': {
+                'success': True,
+                'description': 'Joined chat successfully'
+            }
+        })
+
+    except sqlite3.Error as e:
+        conn.close()
+        return jsonify({
+            'ok': False,
+            'error_code': 500,
+            'description': f'Database error: {str(e)}'
+        }), 500
+
+@validate_json({'chat_id': int})
+def leave_chat(user: sqlite3.Row) -> JSONResponse:
+    data = request.get_json()
+    chat_id = data['chat_id']
+
+    conn = get_db_connection()
+
+    chat = conn.execute(
+        'SELECT * FROM chats WHERE id = ?',
+        (chat_id,)
+    ).fetchone()
+
+    if not chat:
+        conn.close()
+        return jsonify({
+            'ok': False,
+            'error_code': 404,
+            'description': 'Chat not found'
+        }), 404
+
+    member = conn.execute(
+        'SELECT * FROM chat_members WHERE chat_id = ? AND user_id = ?',
+        (chat_id, user['id'])
+    ).fetchone()
+
+    if not member:
+        conn.close()
+        return jsonify({
+            'ok': False,
+            'error_code': 404,
+            'description': 'Not a member of this chat'
+        }), 404
+
+    if member['status'] == 'creator':
+        conn.close()
+        return jsonify({
+            'ok': False,
+            'error_code': 403,
+            'description': 'Creator cannot leave the chat. Transfer ownership first.'
+        }), 403
+
+    try:
+        conn.execute(
+            'DELETE FROM chat_members WHERE chat_id = ? AND user_id = ?',
+            (chat_id, user['id'])
+        )
+        conn.commit()
+        conn.close()
+
+        return jsonify({
+            'ok': True,
+            'result': {
+                'success': True,
+                'description': 'Left chat successfully'
+            }
+        })
+
+    except sqlite3.Error as e:
+        conn.close()
+        return jsonify({
+            'ok': False,
+            'error_code': 500,
+            'description': f'Database error: {str(e)}'
+        }), 500
+
+@validate_json({'chat_id': int})
+def delete_chat(user: sqlite3.Row) -> JSONResponse:
+    data = request.get_json()
+    chat_id = data['chat_id']
+
+    conn = get_db_connection()
+
+    chat = conn.execute(
+        'SELECT * FROM chats WHERE id = ?',
+        (chat_id,)
+    ).fetchone()
+
+    if not chat:
+        conn.close()
+        return jsonify({
+            'ok': False,
+            'error_code': 404,
+            'description': 'Chat not found'
+        }), 404
+
+    member = conn.execute(
+        'SELECT status FROM chat_members WHERE chat_id = ? AND user_id = ?',
+        (chat_id, user['id'])
+    ).fetchone()
+
+    if not member or member['status'] != 'creator':
+        conn.close()
+        return jsonify({
+            'ok': False,
+            'error_code': 403,
+            'description': 'Only the creator can delete the chat'
+        }), 403
+
+    try:
+        conn.execute('DELETE FROM chats WHERE id = ?', (chat_id,))
+        conn.commit()
+        conn.close()
+
+        return jsonify({
+            'ok': True,
+            'result': {
+                'success': True,
+                'description': 'Chat deleted successfully'
+            }
+        })
+
+    except sqlite3.Error as e:
+        conn.close()
+        return jsonify({
+            'ok': False,
+            'error_code': 500,
+            'description': f'Database error: {str(e)}'
+        }), 500
+
+@validate_json({
+    'type': str,
+    'title': str,
+    'username': str,
+    'description': str,
+    'is_public': bool
+})
+def create_chat(user: sqlite3.Row) -> JSONResponse:
+    data = request.get_json()
+    chat_type = data['type']
+    title = data['title']
+    username = data.get('username')
+    description = data.get('description', '')
+    is_public = data['is_public']
+
+    if chat_type not in ['private', 'group', 'channel', 'supergroup']:
+        return jsonify({
+            'ok': False,
+            'error_code': 400,
+            'description': 'Invalid chat type. Must be one of: private, group, channel, supergroup'
+        }), 400
+
+    if is_public and not username:
+        return jsonify({
+            'ok': False,
+            'error_code': 400,
+            'description': 'Public chats must have a username'
+        }), 400
+
+    if not is_public and username:
+        return jsonify({
+            'ok': False,
+            'error_code': 400,
+            'description': 'Private chats cannot have a username'
+        }), 400
+
+    conn = get_db_connection()
+
+    if username:
+        existing_chat = conn.execute(
+            'SELECT id FROM chats WHERE username = ?',
+            (username,)
+        ).fetchone()
+        if existing_chat:
+            conn.close()
+            return jsonify({
+                'ok': False,
+                'error_code': 409,
+                'description': 'Username already taken'
+            }), 409
+
+    try:
+        cursor = conn.cursor()
+        cursor.execute(
+            '''INSERT INTO chats
+            (type, title, username, description, created_by, is_public)
+            VALUES (?, ?, ?, ?, ?, ?)''',
+            (chat_type, title, username, description, user['id'], is_public)
+        )
+        chat_id = cursor.lastrowid
+
+        invite_link = f"https://t.me/{username}"
+
+        cursor.execute(
+            'UPDATE chats SET invite_link = ? WHERE id = ?',
+            (invite_link, chat_id)
+        )
+
+        cursor.execute(
+            '''INSERT INTO chat_members
+            (chat_id, user_id, status)
+            VALUES (?, ?, 'creator')''',
+            (chat_id, user['id'])
+        )
+
+        conn.commit()
+
+        chat = conn.execute(
+            'SELECT * FROM chats WHERE id = ?',
+            (chat_id,)
+        ).fetchone()
+
+        conn.close()
+
+        chat_data = {
+            'id': chat['id'],
+            'type': chat['type'],
+            'title': chat['title'],
+            'username': chat['username'],
+            'description': chat['description'],
+            'invite_link': chat['invite_link'],
+            'is_public': bool(chat['is_public']),
+            'created_at': chat['created_at']
+        }
+
+        return jsonify({'ok': True, 'result': chat_data})
+
+    except sqlite3.Error as e:
+        conn.close()
+        return jsonify({
+            'ok': False,
+            'error_code': 500,
+            'description': f'Database error: {str(e)}'
+        }), 500
+
+@validate_json({'chat_id': int, 'user_id': int})
+def ban_chat_member(user: sqlite3.Row) -> JSONResponse:
+    data = request.get_json()
+    chat_id = data['chat_id']
+    user_id_to_ban = data['user_id']
+
+    conn = get_db_connection()
+
+    chat = conn.execute(
+        'SELECT * FROM chats WHERE id = ?',
+        (chat_id,)
+    ).fetchone()
+
+    if not chat:
+        conn.close()
+        return jsonify({
+            'ok': False,
+            'error_code': 404,
+            'description': 'Chat not found'
+        }), 404
+
+    user_status = conn.execute(
+        'SELECT status FROM chat_members WHERE chat_id = ? AND user_id = ?',
+        (chat_id, user['id'])
+    ).fetchone()
+
+    if not user_status or user_status['status'] not in ['creator', 'administrator']:
+        conn.close()
+        return jsonify({
+            'ok': False,
+            'error_code': 403,
+            'description': 'You do not have permission to ban members'
+        }), 403
+
+    target_user_status = conn.execute(
+        'SELECT status FROM chat_members WHERE chat_id = ? AND user_id = ?',
+        (chat_id, user_id_to_ban)
+    ).fetchone()
+
+    if not target_user_status:
+        conn.close()
+        return jsonify({
+            'ok': False,
+            'error_code': 404,
+            'description': 'User is not a member of this chat'
+        }), 404
+
+    if target_user_status['status'] == 'creator':
+        conn.close()
+        return jsonify({
+            'ok': False,
+            'error_code': 403,
+            'description': 'Cannot ban the chat creator'
+        }), 403
+
+    if user_status['status'] == 'administrator' and target_user_status['status'] == 'administrator':
+        conn.close()
+        return jsonify({
+            'ok': False,
+            'error_code': 403,
+            'description': 'Administrators cannot ban other administrators'
+        }), 403
+
+    try:
+        conn.execute(
+            'UPDATE chat_members SET status = "kicked" WHERE chat_id = ? AND user_id = ?',
+            (chat_id, user_id_to_ban)
+        )
+        conn.commit()
+        conn.close()
+
+        return jsonify({
+            'ok': True,
+            'result': {
+                'success': True,
+                'description': 'User banned successfully'
+            }
+        })
+
+    except sqlite3.Error as e:
+        conn.close()
+        return jsonify({
+            'ok': False,
+            'error_code': 500,
+            'description': f'Database error: {str(e)}'
+        }), 500
+
+@validate_json({'chat_id': int, 'user_id': int})
+def unban_chat_member(user: sqlite3.Row) -> JSONResponse:
+    data = request.get_json()
+    chat_id = data['chat_id']
+    user_id_to_unban = data['user_id']
+
+    conn = get_db_connection()
+
+    chat = conn.execute(
+        'SELECT * FROM chats WHERE id = ?',
+        (chat_id,)
+    ).fetchone()
+
+    if not chat:
+        conn.close()
+        return jsonify({
+            'ok': False,
+            'error_code': 404,
+            'description': 'Chat not found'
+        }), 404
+
+    user_status = conn.execute(
+        'SELECT status FROM chat_members WHERE chat_id = ? AND user_id = ?',
+        (chat_id, user['id'])
+    ).fetchone()
+
+    if not user_status or user_status['status'] not in ['creator', 'administrator']:
+        conn.close()
+        return jsonify({
+            'ok': False,
+            'error_code': 403,
+            'description': 'You do not have permission to unban members'
+        }), 403
+
+    target_user = conn.execute(
+        'SELECT status FROM chat_members WHERE chat_id = ? AND user_id = ?',
+        (chat_id, user_id_to_unban)
+    ).fetchone()
+
+    if not target_user or target_user['status'] != 'kicked':
+        conn.close()
+        return jsonify({
+            'ok': False,
+            'error_code': 404,
+            'description': 'User is not banned from this chat'
+        }), 404
+
+    try:
+        conn.execute(
+            'UPDATE chat_members SET status = "member" WHERE chat_id = ? AND user_id = ?',
+            (chat_id, user_id_to_unban)
+        )
+        conn.commit()
+        conn.close()
+
+        return jsonify({
+            'ok': True,
+            'result': {
+                'success': True,
+                'description': 'User unbanned successfully'
+            }
+        })
+
+    except sqlite3.Error as e:
+        conn.close()
+        return jsonify({
+            'ok': False,
+            'error_code': 500,
+            'description': f'Database error: {str(e)}'
+        }), 500
+
+@validate_json({'chat_id': int, 'action': str})
+def send_chat_action(user: sqlite3.Row) -> JSONResponse:
+    data = request.get_json()
+    chat_id = data['chat_id']
+    action = data['action']
+
+    valid_actions = [
+        'typing', 'upload_photo', 'record_video', 'upload_video',
+        'record_voice', 'upload_voice', 'upload_document', 'choose_sticker',
+        'find_location', 'record_video_note', 'upload_video_note'
+    ]
+
+    if action not in valid_actions:
+        return jsonify({
+            'ok': False,
+            'error_code': 400,
+            'description': 'Invalid action'
+        }), 400
+
+    conn = get_db_connection()
+
+    is_member = conn.execute(
+        'SELECT 1 FROM chat_members WHERE chat_id = ? AND user_id = ?',
+        (chat_id, user['id'])
+    ).fetchone()
+
+    if not is_member:
+        conn.close()
+        return jsonify({
+            'ok': False,
+            'error_code': 403,
+            'description': 'You are not a member of this chat'
+        }), 403
+
+    conn.close()
+
+    return jsonify({
+        'ok': True,
+        'result': {
+            'success': True,
+            'description': f'Chat action "{action}" sent successfully'
+        }
+    })
+
+@validate_json({'user_id': int, 'message': str})
+def send_notification(user: sqlite3.Row) -> JSONResponse:
+    data = request.get_json()
+    user_id = data['user_id']
+    message = data['message']
+
+    conn = get_db_connection()
+
+    target_user = conn.execute(
+        'SELECT id FROM users WHERE id = ?',
+        (user_id,)
+    ).fetchone()
+
+    if not target_user:
+        conn.close()
+        return jsonify({
+            'ok': False,
+            'error_code': 404,
+            'description': 'User not found'
+        }), 404
+
+    conn.close()
+
+    return jsonify({
+        'ok': True,
+        'result': {
+            'success': True,
+            'description': 'Notification sent successfully'
+        }
+    })
+
+def send_document(user: sqlite3.Row) -> JSONResponse:
+    if 'file' not in request.files:
+        return jsonify({
+            'ok': False,
+            'error_code': 400,
+            'description': 'No file provided'
+        }), 400
+
+    file = request.files['file']
+    chat_id = request.form.get('chat_id', type=int)
+    caption = request.form.get('caption', '')
+
+    if not chat_id:
+        return jsonify({
+            'ok': False,
+            'error_code': 400,
+            'description': 'chat_id is required'
+        }), 400
+
+    if file.filename == '':
+        return jsonify({
+            'ok': False,
+            'error_code': 400,
+            'description': 'No file selected'
+        }), 400
+
+    conn = get_db_connection()
+
+    is_member = conn.execute(
+        'SELECT 1 FROM chat_members WHERE chat_id = ? AND user_id = ?',
+        (chat_id, user['id'])
+    ).fetchone()
+
+    if not is_member:
+        conn.close()
+        return jsonify({
+            'ok': False,
+            'error_code': 403,
+            'description': 'You are not a member of this chat'
+        }), 403
+
+    file_id = str(uuid.uuid4())
+    filename = f"{file_id}_{file.filename}"
+    file_path = os.path.join(app.config['UPLOAD_FOLDER'], filename)
+
+    try:
+        file.save(file_path)
+        file_size = os.path.getsize(file_path)
+
+        max_message_id = conn.execute(
+            'SELECT COALESCE(MAX(message_id), 0) as max_id FROM messages WHERE chat_id = ?',
+            (chat_id,)
+        ).fetchone()['max_id']
+        new_message_id = max_message_id + 1
+
+        cursor = conn.cursor()
+        cursor.execute(
+            '''INSERT INTO messages
+            (chat_id, from_user_id, message_id, message_type, caption, file_id, file_size, mime_type)
+            VALUES (?, ?, ?, 'document', ?, ?, ?, ?)''',
+            (chat_id, user['id'], new_message_id, caption, file_id, file_size, file.mimetype)
+        )
+
+        message_id = cursor.lastrowid
+        conn.commit()
+
+        message = conn.execute('''
+            SELECT m.*, u.username, u.first_name, u.last_name
+            FROM messages m
+            JOIN users u ON m.from_user_id = u.id
+            WHERE m.id = ?
+        ''', (message_id,)).fetchone()
+
+        conn.close()
+
+        message_data = {
+            'message_id': message['message_id'],
+            'from': {
+                'id': message['from_user_id'],
+                'username': message['username'],
+                'first_name': message['first_name'],
+                'last_name': message['last_name']
+            },
+            'chat': {'id': chat_id},
+            'date': message['date'],
+            'message_type': message['message_type'],
+            'caption': message['caption'],
+            'document': {
+                'file_id': message['file_id'],
+                'file_size': message['file_size'],
+                'mime_type': message['mime_type']
+            }
+        }
+
+        return jsonify({'ok': True, 'result': message_data})
+
+    except Exception as e:
+        conn.close()
+        if os.path.exists(file_path):
+            os.remove(file_path)
+        return jsonify({
+            'ok': False,
+            'error_code': 500,
+            'description': f'Error uploading file: {str(e)}'
+        }), 500
+
+def fetch_messages(user: sqlite3.Row) -> JSONResponse:
+    chat_id = request.args.get('chat_id', type=int)
+    limit = request.args.get('limit', 50, type=int)
+    offset = request.args.get('offset', 0, type=int)
+
+    if not chat_id:
+        return jsonify({
+            'ok': False,
+            'error_code': 400,
+            'description': 'chat_id parameter is required'
+        }), 400
+
+    conn = get_db_connection()
+
+    is_member = conn.execute(
+        'SELECT 1 FROM chat_members WHERE chat_id = ? AND user_id = ?',
+        (chat_id, user['id'])
+    ).fetchone()
+
+    if not is_member:
+        conn.close()
+        return jsonify({
+            'ok': False,
+            'error_code': 403,
+            'description': 'You are not a member of this chat'
+        }), 403
+
+    messages = conn.execute('''
+        SELECT m.*, u.username, u.first_name, u.last_name
+        FROM messages m
+        JOIN users u ON m.from_user_id = u.id
+        WHERE m.chat_id = ?
+        ORDER BY m.date DESC
+        LIMIT ? OFFSET ?
+    ''', (chat_id, limit, offset)).fetchall()
+
+    result = []
+    for msg in messages:
+        message_data = {
+            'message_id': msg['message_id'],
+            'from': {
+                'id': msg['from_user_id'],
+                'username': msg['username'],
+                'first_name': msg['first_name'],
+                'last_name': msg['last_name']
+            },
+            'chat': {'id': msg['chat_id']},
+            'date': msg['date'],
+            'text': msg['text'],
+            'message_type': msg['message_type'],
+            'caption': msg['caption'],
+            'file_id': msg['file_id'],
+            'file_size': msg['file_size'],
+            'mime_type': msg['mime_type'],
+            'duration': msg['duration'],
+            'width': msg['width'],
+            'height': msg['height'],
+            'reply_to_message_id': msg['reply_to_message_id'],
+            'is_pinned': bool(msg['is_pinned']),
+            'views': msg['views']
+        }
+        result.append(message_data)
+
+    conn.close()
+    return jsonify({'ok': True, 'result': result})
+
+def logout(user: sqlite3.Row) -> JSONResponse:
+    conn = get_db_connection()
+    try:
+        conn.execute(
+            'UPDATE users SET token = NULL, is_online = FALSE WHERE id = ?',
+            (user['id'],)
+        )
+        conn.commit()
+        conn.close()
+
+        return jsonify({
+            'ok': True,
+            'result': {
+                'success': True,
+                'description': 'Logged out successfully'
+            }
+        })
+
+    except sqlite3.Error as e:
+        conn.close()
+        return jsonify({
+            'ok': False,
+            'error_code': 500,
+            'description': f'Database error: {str(e)}'
+        }), 500
+
+def close(user: sqlite3.Row) -> JSONResponse:
+    conn = get_db_connection()
+    try:
+        conn.execute(
+            'UPDATE users SET is_online = FALSE, last_seen = CURRENT_TIMESTAMP WHERE id = ?',
+            (user['id'],)
+        )
+        conn.commit()
+        conn.close()
+
+        return jsonify({
+            'ok': True,
+            'result': {
+                'success': True,
+                'description': 'Connection closed successfully'
+            }
+        })
+
+    except sqlite3.Error as e:
+        conn.close()
+        return jsonify({
+            'ok': False,
+            'error_code': 500,
+            'description': f'Database error: {str(e)}'
+        }), 500
+
+def connect(user: sqlite3.Row) -> JSONResponse:
+    conn = get_db_connection()
+    try:
+        conn.execute(
+            'UPDATE users SET is_online = TRUE, last_seen = CURRENT_TIMESTAMP WHERE id = ?',
+            (user['id'],)
+        )
+        conn.commit()
+        conn.close()
+
+        return jsonify({
+            'ok': True,
+            'result': {
+                'success': True,
+                'description': 'Connected successfully'
+            }
+        })
+
+    except sqlite3.Error as e:
+        conn.close()
+        return jsonify({
+            'ok': False,
+            'error_code': 500,
+            'description': f'Database error: {str(e)}'
+        }), 500
+
+def disconnect(user: sqlite3.Row) -> JSONResponse:
+    conn = get_db_connection()
+    try:
+        conn.execute(
+            'UPDATE users SET is_online = FALSE, last_seen = CURRENT_TIMESTAMP WHERE id = ?',
+            (user['id'],)
+        )
+        conn.commit()
+        conn.close()
+
+        return jsonify({
+            'ok': True,
+            'result': {
+                'success': True,
+                'description': 'Disconnected successfully'
+            }
+        })
+
+    except sqlite3.Error as e:
+        conn.close()
+        return jsonify({
+            'ok': False,
+            'error_code': 500,
+            'description': f'Database error: {str(e)}'
+        }), 500
+
+def refresh(user: sqlite3.Row) -> JSONResponse:
+    conn = get_db_connection()
+    try:
+        conn.execute(
+            'UPDATE users SET last_seen = CURRENT_TIMESTAMP WHERE id = ?',
+            (user['id'],)
+        )
+        conn.commit()
+        conn.close()
+
+        return jsonify({
+            'ok': True,
+            'result': {
+                'success': True,
+                'description': 'Refreshed successfully'
+            }
+        })
+
+    except sqlite3.Error as e:
+        conn.close()
+        return jsonify({
+            'ok': False,
+            'error_code': 500,
+            'description': f'Database error: {str(e)}'
+        }), 500
+
+def update(user: sqlite3.Row) -> JSONResponse:
+    data = request.get_json()
+    first_name = data.get('first_name')
+    last_name = data.get('last_name')
+    phone_number = data.get('phone_number')
+
+    conn = get_db_connection()
+    try:
+        update_fields = []
+        params = []
+
+        if first_name:
+            update_fields.append('first_name = ?')
+            params.append(first_name)
+        if last_name is not None:
+            update_fields.append('last_name = ?')
+            params.append(last_name)
+        if phone_number:
+            update_fields.append('phone_number = ?')
+            params.append(phone_number)
+
+        if not update_fields:
+            conn.close()
+            return jsonify({
+                'ok': False,
+                'error_code': 400,
+                'description': 'No fields to update'
+            }), 400
+
+        params.append(user['id'])
+        query = f'UPDATE users SET {", ".join(update_fields)} WHERE id = ?'
+        conn.execute(query, params)
+        conn.commit()
+
+        updated_user = conn.execute(
+            'SELECT * FROM users WHERE id = ?',
+            (user['id'],)
+        ).fetchone()
+
+        conn.close()
+
+        return jsonify({
+            'ok': True,
+            'result': {
+                'id': updated_user['id'],
+                'username': updated_user['username'],
+                'first_name': updated_user['first_name'],
+                'last_name': updated_user['last_name'],
+                'phone_number': updated_user['phone_number'],
+                'is_bot': bool(updated_user['is_bot']),
+                'is_online': bool(updated_user['is_online']),
+                'last_seen': updated_user['last_seen']
+            }
+        })
+
+    except sqlite3.Error as e:
+        conn.close()
+        return jsonify({
+            'ok': False,
+            'error_code': 500,
+            'description': f'Database error: {str(e)}'
+        }), 500
+
+def upgrade(user: sqlite3.Row) -> JSONResponse:
+    return jsonify({
+        'ok': True,
+        'result': {
+            'success': True,
+            'description': 'Upgrade functionality not implemented yet'
+        }
+    })
+
+def get_user_profile_photos(user: sqlite3.Row) -> JSONResponse:
+    target_user_id = request.args.get('user_id', type=int)
+    offset = request.args.get('offset', 0, type=int)
+    limit = request.args.get('limit', 100, type=int)
+
+    if not target_user_id:
+        return jsonify({
+            'ok': False,
+            'error_code': 400,
+            'description': 'user_id parameter is required'
+        }), 400
+
+    conn = get_db_connection()
+
+    photos = conn.execute('''
+        SELECT * FROM user_profile_photos
+        WHERE user_id = ? AND is_current = TRUE
+        ORDER BY created_at DESC
+        LIMIT ? OFFSET ?
+    ''', (target_user_id, limit, offset)).fetchall()
+
+    result = []
+    for photo in photos:
+        photo_data = {
+            'file_id': photo['file_id'],
+            'file_size': photo['file_size'],
+            'width': photo['width'],
+            'height': photo['height'],
+            'created_at': photo['created_at']
+        }
+        result.append(photo_data)
+
+    conn.close()
+    return jsonify({'ok': True, 'result': result})
+
+@validate_json({'chat_id': int, 'permissions': dict})
+def set_chat_permissions(user: sqlite3.Row) -> JSONResponse:
+    data = request.get_json()
+    chat_id = data['chat_id']
+    permissions = data['permissions']
+
+    conn = get_db_connection()
+
+    user_status = conn.execute(
+        'SELECT status FROM chat_members WHERE chat_id = ? AND user_id = ?',
+        (chat_id, user['id'])
+    ).fetchone()
+
+    if not user_status or user_status['status'] not in ['creator', 'administrator']:
+        conn.close()
+        return jsonify({
+            'ok': False,
+            'error_code': 403,
+            'description': 'You do not have permission to set chat permissions'
+        }), 403
+
+    try:
+        existing_permissions = conn.execute(
+            'SELECT * FROM chat_permissions WHERE chat_id = ?',
+            (chat_id,)
+        ).fetchone()
+
+        if existing_permissions:
+            update_fields = []
+            params = []
+            for key, value in permissions.items():
+                if key in [
+                    'can_send_messages', 'can_send_media_messages', 'can_send_polls',
+                    'can_send_other_messages', 'can_add_web_page_previews',
+                    'can_change_info', 'can_invite_users', 'can_pin_messages',
+                    'can_manage_chat', 'can_manage_video_chats',
+                    'can_restrict_members', 'can_promote_members'
+                ]:
+                    update_fields.append(f'{key} = ?')
+                    params.append(value)
+
+            if update_fields:
+                params.append(chat_id)
+                query = f'UPDATE chat_permissions SET {", ".join(update_fields)} WHERE chat_id = ?'
+                conn.execute(query, params)
+        else:
+            conn.execute(
+                '''INSERT INTO chat_permissions
+                (chat_id, can_send_messages, can_send_media_messages, can_send_polls,
+                 can_send_other_messages, can_add_web_page_previews, can_change_info,
+                 can_invite_users, can_pin_messages, can_manage_chat, can_manage_video_chats,
+                 can_restrict_members, can_promote_messages)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)''',
+                (chat_id,
+                 permissions.get('can_send_messages', True),
+                 permissions.get('can_send_media_messages', True),
+                 permissions.get('can_send_polls', True),
+                 permissions.get('can_send_other_messages', True),
+                 permissions.get('can_add_web_page_previews', True),
+                 permissions.get('can_change_info', False),
+                 permissions.get('can_invite_users', False),
+                 permissions.get('can_pin_messages', False),
+                 permissions.get('can_manage_chat', False),
+                 permissions.get('can_manage_video_chats', False),
+                 permissions.get('can_restrict_members', False),
+                 permissions.get('can_promote_members', False))
+            )
+
+        conn.commit()
+        conn.close()
+
+        return jsonify({
+            'ok': True,
+            'result': {
+                'success': True,
+                'description': 'Chat permissions updated successfully'
+            }
+        })
+
+    except sqlite3.Error as e:
+        conn.close()
+        return jsonify({
+            'ok': False,
+            'error_code': 500,
+            'description': f'Database error: {str(e)}'
+        }), 500
+
+def get_chat_members_count(user: sqlite3.Row) -> JSONResponse:
+    chat_id = request.args.get('chat_id', type=int)
+
+    if not chat_id:
+        return jsonify({
+            'ok': False,
+            'error_code': 400,
+            'description': 'chat_id parameter is required'
+        }), 400
+
+    conn = get_db_connection()
+
+    is_member = conn.execute(
+        'SELECT 1 FROM chat_members WHERE chat_id = ? AND user_id = ?',
+        (chat_id, user['id'])
+    ).fetchone()
+
+    if not is_member:
+        conn.close()
+        return jsonify({
+            'ok': False,
+            'error_code': 403,
+            'description': 'You are not a member of this chat'
+        }), 403
+
+    count = conn.execute(
+        'SELECT COUNT(*) as count FROM chat_members WHERE chat_id = ? AND status != "kicked"',
+        (chat_id,)
+    ).fetchone()['count']
+
+    conn.close()
+    return jsonify({'ok': True, 'result': count})
+
+def get_chat_member(user: sqlite3.Row) -> JSONResponse:
+    chat_id = request.args.get('chat_id', type=int)
+    user_id = request.args.get('user_id', type=int)
+
+    if not chat_id or not user_id:
+        return jsonify({
+            'ok': False,
+            'error_code': 400,
+            'description': 'chat_id and user_id parameters are required'
+        }), 400
+
+    conn = get_db_connection()
+
+    is_member = conn.execute(
+        'SELECT 1 FROM chat_members WHERE chat_id = ? AND user_id = ?',
+        (chat_id, user['id'])
+    ).fetchone()
+
+    if not is_member:
+        conn.close()
+        return jsonify({
+            'ok': False,
+            'error_code': 403,
+            'description': 'You are not a member of this chat'
+        }), 403
+
+    member = conn.execute('''
+        SELECT cm.*, u.username, u.first_name, u.last_name
+        FROM chat_members cm
+        JOIN users u ON cm.user_id = u.id
+        WHERE cm.chat_id = ? AND cm.user_id = ?
+    ''', (chat_id, user_id)).fetchone()
+
+    if not member:
+        conn.close()
+        return jsonify({
+            'ok': False,
+            'error_code': 404,
+            'description': 'Chat member not found'
+        }), 404
+
+    member_data = {
+        'user': {
+            'id': member['user_id'],
+            'username': member['username'],
+            'first_name': member['first_name'],
+            'last_name': member['last_name']
+        },
+        'status': member['status'],
+        'custom_title': member['custom_title'],
+        'until_date': member['until_date'],
+        'can_send_messages': bool(member['can_send_messages']),
+        'can_send_media_messages': bool(member['can_send_media_messages']),
+        'can_send_polls': bool(member['can_send_polls']),
+        'can_send_other_messages': bool(member['can_send_other_messages']),
+        'can_add_web_page_previews': bool(member['can_add_web_page_previews']),
+        'can_change_info': bool(member['can_change_info']),
+        'can_invite_users': bool(member['can_invite_users']),
+        'can_pin_messages': bool(member['can_pin_messages']),
+        'joined_date': member['joined_date']
+    }
+
+    conn.close()
+    return jsonify({'ok': True, 'result': member_data})
+
+def set_chat_photo(user: sqlite3.Row) -> JSONResponse:
+    if 'photo' not in request.files:
+        return jsonify({
+            'ok': False,
+            'error_code': 400,
+            'description': 'No photo provided'
+        }), 400
+
+    photo = request.files['photo']
+    chat_id = request.form.get('chat_id', type=int)
+
+    if not chat_id:
+        return jsonify({
+            'ok': False,
+            'error_code': 400,
+            'description': 'chat_id is required'
+        }), 400
+
+    if photo.filename == '':
+        return jsonify({
+            'ok': False,
+            'error_code': 400,
+            'description': 'No photo selected'
+        }), 400
+
+    conn = get_db_connection()
+
+    user_status = conn.execute(
+        'SELECT status FROM chat_members WHERE chat_id = ? AND user_id = ?',
+        (chat_id, user['id'])
+    ).fetchone()
+
+    if not user_status or user_status['status'] not in ['creator', 'administrator']:
+        conn.close()
+        return jsonify({
+            'ok': False,
+            'error_code': 403,
+            'description': 'You do not have permission to set chat photo'
+        }), 403
+
+    file_id = str(uuid.uuid4())
+    filename = f"{file_id}_{photo.filename}"
+    file_path = os.path.join(app.config['UPLOAD_FOLDER'], filename)
+
+    try:
+        photo.save(file_path)
+
+        conn.execute(
+            'UPDATE chats SET photo_file_id = ? WHERE id = ?',
+            (file_id, chat_id)
+        )
+        conn.commit()
+        conn.close()
+
+        return jsonify({
+            'ok': True,
+            'result': {
+                'success': True,
+                'description': 'Chat photo updated successfully'
+            }
+        })
+
+    except Exception as e:
+        conn.close()
+        if os.path.exists(file_path):
+            os.remove(file_path)
+        return jsonify({
+            'ok': False,
+            'error_code': 500,
+            'description': f'Error uploading photo: {str(e)}'
+        }), 500
+
+def delete_chat_photo(user: sqlite3.Row) -> JSONResponse:
+    chat_id = request.args.get('chat_id', type=int)
+
+    if not chat_id:
+        return jsonify({
+            'ok': False,
+            'error_code': 400,
+            'description': 'chat_id parameter is required'
+        }), 400
+
+    conn = get_db_connection()
+
+    user_status = conn.execute(
+        'SELECT status FROM chat_members WHERE chat_id = ? AND user_id = ?',
+        (chat_id, user['id'])
+    ).fetchone()
+
+    if not user_status or user_status['status'] not in ['creator', 'administrator']:
+        conn.close()
+        return jsonify({
+            'ok': False,
+            'error_code': 403,
+            'description': 'You do not have permission to delete chat photo'
+        }), 403
+
+    try:
+        conn.execute(
+            'UPDATE chats SET photo_file_id = NULL WHERE id = ?',
+            (chat_id,)
+        )
+        conn.commit()
+        conn.close()
+
+        return jsonify({
+            'ok': True,
+            'result': {
+                'success': True,
+                'description': 'Chat photo deleted successfully'
+            }
+        })
+
+    except sqlite3.Error as e:
+        conn.close()
+        return jsonify({
+            'ok': False,
+            'error_code': 500,
+            'description': f'Database error: {str(e)}'
+        }), 500
+
+@validate_json({'chat_id': int, 'title': str})
+def set_chat_title(user: sqlite3.Row) -> JSONResponse:
+    data = request.get_json()
+    chat_id = data['chat_id']
+    title = data['title']
+
+    conn = get_db_connection()
+
+    user_status = conn.execute(
+        'SELECT status FROM chat_members WHERE chat_id = ? AND user_id = ?',
+        (chat_id, user['id'])
+    ).fetchone()
+
+    if not user_status or user_status['status'] not in ['creator', 'administrator']:
+        conn.close()
+        return jsonify({
+            'ok': False,
+            'error_code': 403,
+            'description': 'You do not have permission to set chat title'
+        }), 403
+
+    try:
+        conn.execute(
+            'UPDATE chats SET title = ? WHERE id = ?',
+            (title, chat_id)
+        )
+        conn.commit()
+        conn.close()
+
+        return jsonify({
+            'ok': True,
+            'result': {
+                'success': True,
+                'description': 'Chat title updated successfully'
+            }
+        })
+
+    except sqlite3.Error as e:
+        conn.close()
+        return jsonify({
+            'ok': False,
+            'error_code': 500,
+            'description': f'Database error: {str(e)}'
+        }), 500
+
+@validate_json({'chat_id': int, 'description': str})
+def set_chat_description(user: sqlite3.Row) -> JSONResponse:
+    data = request.get_json()
+    chat_id = data['chat_id']
+    description = data['description']
+
+    conn = get_db_connection()
+
+    user_status = conn.execute(
+        'SELECT status FROM chat_members WHERE chat_id = ? AND user_id = ?',
+        (chat_id, user['id'])
+    ).fetchone()
+
+    if not user_status or user_status['status'] not in ['creator', 'administrator']:
+        conn.close()
+        return jsonify({
+            'ok': False,
+            'error_code': 403,
+            'description': 'You do not have permission to set chat description'
+        }), 403
+
+    try:
+        conn.execute(
+            'UPDATE chats SET description = ? WHERE id = ?',
+            (description, chat_id)
+        )
+        conn.commit()
+        conn.close()
+
+        return jsonify({
+            'ok': True,
+            'result': {
+                'success': True,
+                'description': 'Chat description updated successfully'
+            }
+        })
+
+    except sqlite3.Error as e:
+        conn.close()
+        return jsonify({
+            'ok': False,
+            'error_code': 500,
+            'description': f'Database error: {str(e)}'
+        }), 500
+
+@validate_json({'chat_id': int, 'message_id': int})
+def pin_chat_message(user: sqlite3.Row) -> JSONResponse:
+    data = request.get_json()
+    chat_id = data['chat_id']
+    message_id = data['message_id']
+
+    conn = get_db_connection()
+
+    user_status = conn.execute(
+        'SELECT status FROM chat_members WHERE chat_id = ? AND user_id = ?',
+        (chat_id, user['id'])
+    ).fetchone()
+
+    if not user_status or user_status['status'] not in ['creator', 'administrator']:
+        conn.close()
+        return jsonify({
+            'ok': False,
+            'error_code': 403,
+            'description': 'You do not have permission to pin messages'
+        }), 403
+
+    message = conn.execute(
+        'SELECT * FROM messages WHERE chat_id = ? AND message_id = ?',
+        (chat_id, message_id)
+    ).fetchone()
+
+    if not message:
+        conn.close()
+        return jsonify({
+            'ok': False,
+            'error_code': 404,
+            'description': 'Message not found'
+        }), 404
+
+    try:
+        conn.execute(
+            'UPDATE messages SET is_pinned = TRUE WHERE id = ?',
+            (message['id'],)
+        )
+
+        conn.execute(
+            'INSERT INTO pinned_messages (chat_id, message_id, pinned_by) VALUES (?, ?, ?)',
+            (chat_id, message_id, user['id'])
+        )
+        conn.commit()
+        conn.close()
+
+        return jsonify({
+            'ok': True,
+            'result': {
+                'success': True,
+                'description': 'Message pinned successfully'
+            }
+        })
+
+    except sqlite3.Error as e:
+        conn.close()
+        return jsonify({
+            'ok': False,
+            'error_code': 500,
+            'description': f'Database error: {str(e)}'
+        }), 500
+
+@validate_json({'chat_id': int, 'message_id': int})
+def unpin_chat_message(user: sqlite3.Row) -> JSONResponse:
+    data = request.get_json()
+    chat_id = data['chat_id']
+    message_id = data['message_id']
+
+    conn = get_db_connection()
+
+    user_status = conn.execute(
+        'SELECT status FROM chat_members WHERE chat_id = ? AND user_id = ?',
+        (chat_id, user['id'])
+    ).fetchone()
+
+    if not user_status or user_status['status'] not in ['creator', 'administrator']:
+        conn.close()
+        return jsonify({
+            'ok': False,
+            'error_code': 403,
+            'description': 'You do not have permission to unpin messages'
+        }), 403
+
+    message = conn.execute(
+        'SELECT * FROM messages WHERE chat_id = ? AND message_id = ?',
+        (chat_id, message_id)
+    ).fetchone()
+
+    if not message:
+        conn.close()
+        return jsonify({
+            'ok': False,
+            'error_code': 404,
+            'description': 'Message not found'
+        }), 404
+
+    try:
+        conn.execute(
+            'UPDATE messages SET is_pinned = FALSE WHERE id = ?',
+            (message['id'],)
+        )
+
+        conn.execute(
+            'DELETE FROM pinned_messages WHERE chat_id = ? AND message_id = ?',
+            (chat_id, message_id)
+        )
+        conn.commit()
+        conn.close()
+
+        return jsonify({
+            'ok': True,
+            'result': {
+                'success': True,
+                'description': 'Message unpinned successfully'
+            }
+        })
+
+    except sqlite3.Error as e:
+        conn.close()
+        return jsonify({
+            'ok': False,
+            'error_code': 500,
+            'description': f'Database error: {str(e)}'
+        }), 500
+
+@validate_json({'chat_id': int})
+def unpin_all_chat_messages(user: sqlite3.Row) -> JSONResponse:
+    data = request.get_json()
+    chat_id = data['chat_id']
+
+    conn = get_db_connection()
+
+    user_status = conn.execute(
+        'SELECT status FROM chat_members WHERE chat_id = ? AND user_id = ?',
+        (chat_id, user['id'])
+    ).fetchone()
+
+    if not user_status or user_status['status'] not in ['creator', 'administrator']:
+        conn.close()
+        return jsonify({
+            'ok': False,
+            'error_code': 403,
+            'description': 'You do not have permission to unpin messages'
+        }), 403
+
+    try:
+        conn.execute(
+            'UPDATE messages SET is_pinned = FALSE WHERE chat_id = ?',
+            (chat_id,)
+        )
+
+        conn.execute(
+            'DELETE FROM pinned_messages WHERE chat_id = ?',
+            (chat_id,)
+        )
+        conn.commit()
+        conn.close()
+
+        return jsonify({
+            'ok': True,
+            'result': {
+                'success': True,
+                'description': 'All messages unpinned successfully'
+            }
+        })
+
+    except sqlite3.Error as e:
+        conn.close()
+        return jsonify({
+            'ok': False,
+            'error_code': 500,
+            'description': f'Database error: {str(e)}'
+        }), 500
+
+@validate_json({'callback_query_id': str, 'text': str, 'show_alert': bool})
+def answer_callback_query(user: sqlite3.Row) -> JSONResponse:
+    data = request.get_json()
+    callback_query_id = data['callback_query_id']
+    text = data['text']
+    show_alert = data.get('show_alert', False)
+
+    return jsonify({
+        'ok': True,
+        'result': {
+            'callback_query_id': callback_query_id,
+            'text': text,
+            'show_alert': show_alert,
+            'success': True
+        }
+    })
+
+@validate_json({'chat_id': int, 'message_id': int, 'reaction': str})
+def set_message_reaction(user: sqlite3.Row) -> JSONResponse:
+    data = request.get_json()
+    chat_id = data['chat_id']
+    message_id = data['message_id']
+    reaction = data['reaction']
+
+    conn = get_db_connection()
+
+    is_member = conn.execute(
+        'SELECT 1 FROM chat_members WHERE chat_id = ? AND user_id = ?',
+        (chat_id, user['id'])
+    ).fetchone()
+
+    if not is_member:
+        conn.close()
+        return jsonify({
+            'ok': False,
+            'error_code': 403,
+            'description': 'You are not a member of this chat'
+        }), 403
+
+    message = conn.execute(
+        'SELECT * FROM messages WHERE chat_id = ? AND message_id = ?',
+        (chat_id, message_id)
+    ).fetchone()
+
+    if not message:
+        conn.close()
+        return jsonify({
+            'ok': False,
+            'error_code': 404,
+            'description': 'Message not found'
+        }), 404
+
+    try:
+        existing_reaction = conn.execute(
+            'SELECT * FROM reactions WHERE message_id = ? AND user_id = ?',
+            (message['id'], user['id'])
+        ).fetchone()
+
+        if existing_reaction:
+            conn.execute(
+                'UPDATE reactions SET emoji = ? WHERE message_id = ? AND user_id = ?',
+                (reaction, message['id'], user['id'])
+            )
+        else:
+            conn.execute(
+                'INSERT INTO reactions (message_id, user_id, emoji) VALUES (?, ?, ?)',
+                (message['id'], user['id'], reaction)
+            )
+
+        conn.commit()
+        conn.close()
+
+        return jsonify({
+            'ok': True,
+            'result': {
+                'success': True,
+                'description': 'Reaction set successfully'
+            }
+        })
+
+    except sqlite3.Error as e:
+        conn.close()
+        return jsonify({
+            'ok': False,
+            'error_code': 500,
+            'description': f'Database error: {str(e)}'
+        }), 500
+
+def get_message_reactions(user: sqlite3.Row) -> JSONResponse:
+    chat_id = request.args.get('chat_id', type=int)
+    message_id = request.args.get('message_id', type=int)
+
+    if not chat_id or not message_id:
+        return jsonify({
+            'ok': False,
+            'error_code': 400,
+            'description': 'chat_id and message_id parameters are required'
+        }), 400
+
+    conn = get_db_connection()
+
+    is_member = conn.execute(
+        'SELECT 1 FROM chat_members WHERE chat_id = ? AND user_id = ?',
+        (chat_id, user['id'])
+    ).fetchone()
+
+    if not is_member:
+        conn.close()
+        return jsonify({
+            'ok': False,
+            'error_code': 403,
+            'description': 'You are not a member of this chat'
+        }), 403
+
+    message = conn.execute(
+        'SELECT * FROM messages WHERE chat_id = ? AND message_id = ?',
+        (chat_id, message_id)
+    ).fetchone()
+
+    if not message:
+        conn.close()
+        return jsonify({
+            'ok': False,
+            'error_code': 404,
+            'description': 'Message not found'
+        }), 404
+
+    reactions = conn.execute('''
+        SELECT r.emoji, COUNT(*) as count,
+               GROUP_CONCAT(u.username) as users
+        FROM reactions r
+        JOIN users u ON r.user_id = u.id
+        WHERE r.message_id = ?
+        GROUP BY r.emoji
+    ''', (message['id'],)).fetchall()
+
+    result = []
+    for reaction in reactions:
+        reaction_data = {
+            'emoji': reaction['emoji'],
+            'count': reaction['count'],
+            'users': reaction['users'].split(',') if reaction['users'] else []
+        }
+        result.append(reaction_data)
+
+    conn.close()
+    return jsonify({'ok': True, 'result': result})
+
+@validate_json({'chat_id': int, 'from_chat_id': int, 'message_id': int})
+def forward_message(user: sqlite3.Row) -> JSONResponse:
+    data = request.get_json()
+    chat_id = data['chat_id']
+    from_chat_id = data['from_chat_id']
+    message_id = data['message_id']
+
+    conn = get_db_connection()
+
+    is_member_target = conn.execute(
+        'SELECT 1 FROM chat_members WHERE chat_id = ? AND user_id = ?',
+        (chat_id, user['id'])
+    ).fetchone()
+
+    if not is_member_target:
+        conn.close()
+        return jsonify({
+            'ok': False,
+            'error_code': 403,
+            'description': 'You are not a member of the target chat'
+        }), 403
+
+    is_member_source = conn.execute(
+        'SELECT 1 FROM chat_members WHERE chat_id = ? AND user_id = ?',
+        (from_chat_id, user['id'])
+    ).fetchone()
+
+    if not is_member_source:
+        conn.close()
+        return jsonify({
+            'ok': False,
+            'error_code': 403,
+            'description': 'You are not a member of the source chat'
+        }), 403
+
+    message = conn.execute(
+        'SELECT * FROM messages WHERE chat_id = ? AND message_id = ?',
+        (from_chat_id, message_id)
+    ).fetchone()
+
+    if not message:
+        conn.close()
+        return jsonify({
+            'ok': False,
+            'error_code': 404,
+            'description': 'Message not found'
+        }), 404
+
+    try:
+        max_message_id = conn.execute(
+            'SELECT COALESCE(MAX(message_id), 0) as max_id FROM messages WHERE chat_id = ?',
+            (chat_id,)
+        ).fetchone()['max_id']
+        new_message_id = max_message_id + 1
+
+        cursor = conn.cursor()
+        cursor.execute(
+            '''INSERT INTO messages
+            (chat_id, from_user_id, message_id, text, message_type, caption,
+             file_id, file_size, mime_type, duration, width, height)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)''',
+            (chat_id, user['id'], new_message_id, message['text'], message['message_type'],
+             message['caption'], message['file_id'], message['file_size'], message['mime_type'],
+             message['duration'], message['width'], message['height'])
+        )
+
+        new_message_db_id = cursor.lastrowid
+        conn.commit()
+
+        forwarded_message = conn.execute('''
+            SELECT m.*, u.username, u.first_name, u.last_name
+            FROM messages m
+            JOIN users u ON m.from_user_id = u.id
+            WHERE m.id = ?
+        ''', (new_message_db_id,)).fetchone()
+
+        conn.close()
+
+        message_data = {
+            'message_id': forwarded_message['message_id'],
+            'from': {
+                'id': forwarded_message['from_user_id'],
+                'username': forwarded_message['username'],
+                'first_name': forwarded_message['first_name'],
+                'last_name': forwarded_message['last_name']
+            },
+            'chat': {'id': chat_id},
+            'date': forwarded_message['date'],
+            'forwarded_from': {
+                'chat_id': from_chat_id,
+                'message_id': message_id
+            },
+            'text': forwarded_message['text'],
+            'message_type': forwarded_message['message_type'],
+            'caption': forwarded_message['caption'],
+            'file_id': forwarded_message['file_id']
+        }
+
+        return jsonify({'ok': True, 'result': message_data})
+
+    except sqlite3.Error as e:
+        conn.close()
+        return jsonify({
+            'ok': False,
+            'error_code': 500,
+            'description': f'Database error: {str(e)}'
+        }), 500
+
+@validate_json({'chat_id': int, 'from_chat_id': int, 'message_id': int})
+def copy_message(user: sqlite3.Row) -> JSONResponse:
+    data = request.get_json()
+    chat_id = data['chat_id']
+    from_chat_id = data['from_chat_id']
+    message_id = data['message_id']
+
+    conn = get_db_connection()
+
+    is_member_target = conn.execute(
+        'SELECT 1 FROM chat_members WHERE chat_id = ? AND user_id = ?',
+        (chat_id, user['id'])
+    ).fetchone()
+
+    if not is_member_target:
+        conn.close()
+        return jsonify({
+            'ok': False,
+            'error_code': 403,
+            'description': 'You are not a member of the target chat'
+        }), 403
+
+    is_member_source = conn.execute(
+        'SELECT 1 FROM chat_members WHERE chat_id = ? AND user_id = ?',
+        (from_chat_id, user['id'])
+    ).fetchone()
+
+    if not is_member_source:
+        conn.close()
+        return jsonify({
+            'ok': False,
+            'error_code': 403,
+            'description': 'You are not a member of the source chat'
+        }), 403
+
+    message = conn.execute(
+        'SELECT * FROM messages WHERE chat_id = ? AND message_id = ?',
+        (from_chat_id, message_id)
+    ).fetchone()
+
+    if not message:
+        conn.close()
+        return jsonify({
+            'ok': False,
+            'error_code': 404,
+            'description': 'Message not found'
+        }), 404
+
+    try:
+        max_message_id = conn.execute(
+            'SELECT COALESCE(MAX(message_id), 0) as max_id FROM messages WHERE chat_id = ?',
+            (chat_id,)
+        ).fetchone()['max_id']
+        new_message_id = max_message_id + 1
+
+        cursor = conn.cursor()
+        cursor.execute(
+            '''INSERT INTO messages
+            (chat_id, from_user_id, message_id, text, message_type, caption,
+             file_id, file_size, mime_type, duration, width, height)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)''',
+            (chat_id, user['id'], new_message_id, message['text'], message['message_type'],
+             message['caption'], message['file_id'], message['file_size'], message['mime_type'],
+             message['duration'], message['width'], message['height'])
+        )
+
+        new_message_db_id = cursor.lastrowid
+        conn.commit()
+
+        copied_message = conn.execute('''
+            SELECT m.*, u.username, u.first_name, u.last_name
+            FROM messages m
+            JOIN users u ON m.from_user_id = u.id
+            WHERE m.id = ?
+        ''', (new_message_db_id,)).fetchone()
+
+        conn.close()
+
+        message_data = {
+            'message_id': copied_message['message_id'],
+            'from': {
+                'id': copied_message['from_user_id'],
+                'username': copied_message['username'],
+                'first_name': copied_message['first_name'],
+                'last_name': copied_message['last_name']
+            },
+            'chat': {'id': chat_id},
+            'date': copied_message['date'],
+            'text': copied_message['text'],
+            'message_type': copied_message['message_type'],
+            'caption': copied_message['caption'],
+            'file_id': copied_message['file_id']
+        }
+
+        return jsonify({'ok': True, 'result': message_data})
+
+    except sqlite3.Error as e:
+        conn.close()
+        return jsonify({
+            'ok': False,
+            'error_code': 500,
+            'description': f'Database error: {str(e)}'
+        }), 500
+
+def send_photo(user: sqlite3.Row) -> JSONResponse:
+    if 'photo' not in request.files:
+        return jsonify({
+            'ok': False,
+            'error_code': 400,
+            'description': 'No photo provided'
+        }), 400
+
+    photo = request.files['photo']
+    chat_id = request.form.get('chat_id', type=int)
+    caption = request.form.get('caption', '')
+
+    if not chat_id:
+        return jsonify({
+            'ok': False,
+            'error_code': 400,
+            'description': 'chat_id is required'
+        }), 400
+
+    if photo.filename == '':
+        return jsonify({
+            'ok': False,
+            'error_code': 400,
+            'description': 'No photo selected'
+        }), 400
+
+    conn = get_db_connection()
+
+    is_member = conn.execute(
+        'SELECT 1 FROM chat_members WHERE chat_id = ? AND user_id = ?',
+        (chat_id, user['id'])
+    ).fetchone()
+
+    if not is_member:
+        conn.close()
+        return jsonify({
+            'ok': False,
+            'error_code': 403,
+            'description': 'You are not a member of this chat'
+        }), 403
+
+    file_id = str(uuid.uuid4())
+    filename = f"{file_id}_{photo.filename}"
+    file_path = os.path.join(app.config['UPLOAD_FOLDER'], filename)
+
+    try:
+        photo.save(file_path)
+        file_size = os.path.getsize(file_path)
+
+        from PIL import Image
+        img = Image.open(file_path)
+        width, height = img.size
+
+        max_message_id = conn.execute(
+            'SELECT COALESCE(MAX(message_id), 0) as max_id FROM messages WHERE chat_id = ?',
+            (chat_id,)
+        ).fetchone()['max_id']
+        new_message_id = max_message_id + 1
+
+        cursor = conn.cursor()
+        cursor.execute(
+            '''INSERT INTO messages
+            (chat_id, from_user_id, message_id, message_type, caption, file_id, file_size, mime_type, width, height)
+            VALUES (?, ?, ?, 'photo', ?, ?, ?, ?, ?, ?)''',
+            (chat_id, user['id'], new_message_id, caption, file_id, file_size, photo.mimetype, width, height)
+        )
+
+        message_id = cursor.lastrowid
+        conn.commit()
+
+        message = conn.execute('''
+            SELECT m.*, u.username, u.first_name, u.last_name
+            FROM messages m
+            JOIN users u ON m.from_user_id = u.id
+            WHERE m.id = ?
+        ''', (message_id,)).fetchone()
+
+        conn.close()
+
+        message_data = {
+            'message_id': message['message_id'],
+            'from': {
+                'id': message['from_user_id'],
+                'username': message['username'],
+                'first_name': message['first_name'],
+                'last_name': message['last_name']
+            },
+            'chat': {'id': chat_id},
+            'date': message['date'],
+            'message_type': message['message_type'],
+            'caption': message['caption'],
+            'photo': {
+                'file_id': message['file_id'],
+                'file_size': message['file_size'],
+                'width': message['width'],
+                'height': message['height']
+            }
+        }
+
+        return jsonify({'ok': True, 'result': message_data})
+
+    except Exception as e:
+        conn.close()
+        if os.path.exists(file_path):
+            os.remove(file_path)
+        return jsonify({
+            'ok': False,
+            'error_code': 500,
+            'description': f'Error uploading photo: {str(e)}'
+        }), 500
+
+def send_audio(user: sqlite3.Row) -> JSONResponse:
+    if 'audio' not in request.files:
+        return jsonify({
+            'ok': False,
+            'error_code': 400,
+            'description': 'No audio provided'
+        }), 400
+
+    audio = request.files['audio']
+    chat_id = request.form.get('chat_id', type=int)
+    caption = request.form.get('caption', '')
+    duration = request.form.get('duration', type=int)
+
+    if not chat_id:
+        return jsonify({
+            'ok': False,
+            'error_code': 400,
+            'description': 'chat_id is required'
+        }), 400
+
+    if audio.filename == '':
+        return jsonify({
+            'ok': False,
+            'error_code': 400,
+            'description': 'No audio selected'
+        }), 400
+
+    conn = get_db_connection()
+
+    is_member = conn.execute(
+        'SELECT 1 FROM chat_members WHERE chat_id = ? AND user_id = ?',
+        (chat_id, user['id'])
+    ).fetchone()
+
+    if not is_member:
+        conn.close()
+        return jsonify({
+            'ok': False,
+            'error_code': 403,
+            'description': 'You are not a member of this chat'
+        }), 403
+
+    file_id = str(uuid.uuid4())
+    filename = f"{file_id}_{audio.filename}"
+    file_path = os.path.join(app.config['UPLOAD_FOLDER'], filename)
+
+    try:
+        audio.save(file_path)
+        file_size = os.path.getsize(file_path)
+
+        max_message_id = conn.execute(
+            'SELECT COALESCE(MAX(message_id), 0) as max_id FROM messages WHERE chat_id = ?',
+            (chat_id,)
+        ).fetchone()['max_id']
+        new_message_id = max_message_id + 1
+
+        cursor = conn.cursor()
+        cursor.execute(
+            '''INSERT INTO messages
+            (chat_id, from_user_id, message_id, message_type, caption, file_id, file_size, mime_type, duration)
+            VALUES (?, ?, ?, 'audio', ?, ?, ?, ?, ?)''',
+            (chat_id, user['id'], new_message_id, caption, file_id, file_size, audio.mimetype, duration)
+        )
+
+        message_id = cursor.lastrowid
+        conn.commit()
+
+        message = conn.execute('''
+            SELECT m.*, u.username, u.first_name, u.last_name
+            FROM messages m
+            JOIN users u ON m.from_user_id = u.id
+            WHERE m.id = ?
+        ''', (message_id,)).fetchone()
+
+        conn.close()
+
+        message_data = {
+            'message_id': message['message_id'],
+            'from': {
+                'id': message['from_user_id'],
+                'username': message['username'],
+                'first_name': message['first_name'],
+                'last_name': message['last_name']
+            },
+            'chat': {'id': chat_id},
+            'date': message['date'],
+            'message_type': message['message_type'],
+            'caption': message['caption'],
+            'audio': {
+                'file_id': message['file_id'],
+                'file_size': message['file_size'],
+                'duration': message['duration'],
+                'mime_type': message['mime_type']
+            }
+        }
+
+        return jsonify({'ok': True, 'result': message_data})
+
+    except Exception as e:
+        conn.close()
+        if os.path.exists(file_path):
+            os.remove(file_path)
+        return jsonify({
+            'ok': False,
+            'error_code': 500,
+            'description': f'Error uploading audio: {str(e)}'
+        }), 500
+
+def send_video(user: sqlite3.Row) -> JSONResponse:
+    if 'video' not in request.files:
+        return jsonify({
+            'ok': False,
+            'error_code': 400,
+            'description': 'No video provided'
+        }), 400
+
+    video = request.files['video']
+    chat_id = request.form.get('chat_id', type=int)
+    caption = request.form.get('caption', '')
+    duration = request.form.get('duration', type=int)
+
+    if not chat_id:
+        return jsonify({
+            'ok': False,
+            'error_code': 400,
+            'description': 'chat_id is required'
+        }), 400
+
+    if video.filename == '':
+        return jsonify({
+            'ok': False,
+            'error_code': 400,
+            'description': 'No video selected'
+        }), 400
+
+    conn = get_db_connection()
+
+    is_member = conn.execute(
+        'SELECT 1 FROM chat_members WHERE chat_id = ? AND user_id = ?',
+        (chat_id, user['id'])
+    ).fetchone()
+
+    if not is_member:
+        conn.close()
+        return jsonify({
+            'ok': False,
+            'error_code': 403,
+            'description': 'You are not a member of this chat'
+        }), 403
+
+    file_id = str(uuid.uuid4())
+    filename = f"{file_id}_{video.filename}"
+    file_path = os.path.join(app.config['UPLOAD_FOLDER'], filename)
+
+    try:
+        video.save(file_path)
+        file_size = os.path.getsize(file_path)
+
+        max_message_id = conn.execute(
+            'SELECT COALESCE(MAX(message_id), 0) as max_id FROM messages WHERE chat_id = ?',
+            (chat_id,)
+        ).fetchone()['max_id']
+        new_message_id = max_message_id + 1
+
+        cursor = conn.cursor()
+        cursor.execute(
+            '''INSERT INTO messages
+            (chat_id, from_user_id, message_id, message_type, caption, file_id, file_size, mime_type, duration)
+            VALUES (?, ?, ?, 'video', ?, ?, ?, ?, ?)''',
+            (chat_id, user['id'], new_message_id, caption, file_id, file_size, video.mimetype, duration)
+        )
+
+        message_id = cursor.lastrowid
+        conn.commit()
+
+        message = conn.execute('''
+            SELECT m.*, u.username, u.first_name, u.last_name
+            FROM messages m
+            JOIN users u ON m.from_user_id = u.id
+            WHERE m.id = ?
+        ''', (message_id,)).fetchone()
+
+        conn.close()
+
+        message_data = {
+            'message_id': message['message_id'],
+            'from': {
+                'id': message['from_user_id'],
+                'username': message['username'],
+                'first_name': message['first_name'],
+                'last_name': message['last_name']
+            },
+            'chat': {'id': chat_id},
+            'date': message['date'],
+            'message_type': message['message_type'],
+            'caption': message['caption'],
+            'video': {
+                'file_id': message['file_id'],
+                'file_size': message['file_size'],
+                'duration': message['duration'],
+                'mime_type': message['mime_type']
+            }
+        }
+
+        return jsonify({'ok': True, 'result': message_data})
+
+    except Exception as e:
+        conn.close()
+        if os.path.exists(file_path):
+            os.remove(file_path)
+        return jsonify({
+            'ok': False,
+            'error_code': 500,
+            'description': f'Error uploading video: {str(e)}'
+        }), 500
+
+def send_voice(user: sqlite3.Row) -> JSONResponse:
+    if 'voice' not in request.files:
+        return jsonify({
+            'ok': False,
+            'error_code': 400,
+            'description': 'No voice message provided'
+        }), 400
+
+    voice = request.files['voice']
+    chat_id = request.form.get('chat_id', type=int)
+    caption = request.form.get('caption', '')
+    duration = request.form.get('duration', type=int)
+
+    if not chat_id:
+        return jsonify({
+            'ok': False,
+            'error_code': 400,
+            'description': 'chat_id is required'
+        }), 400
+
+    if voice.filename == '':
+        return jsonify({
+            'ok': False,
+            'error_code': 400,
+            'description': 'No voice message selected'
+        }), 400
+
+    conn = get_db_connection()
+
+    is_member = conn.execute(
+        'SELECT 1 FROM chat_members WHERE chat_id = ? AND user_id = ?',
+        (chat_id, user['id'])
+    ).fetchone()
+
+    if not is_member:
+        conn.close()
+        return jsonify({
+            'ok': False,
+            'error_code': 403,
+            'description': 'You are not a member of this chat'
+        }), 403
+
+    file_id = str(uuid.uuid4())
+    filename = f"{file_id}_{voice.filename}"
+    file_path = os.path.join(app.config['UPLOAD_FOLDER'], filename)
+
+    try:
+        voice.save(file_path)
+        file_size = os.path.getsize(file_path)
+
+        max_message_id = conn.execute(
+            'SELECT COALESCE(MAX(message_id), 0) as max_id FROM messages WHERE chat_id = ?',
+            (chat_id,)
+        ).fetchone()['max_id']
+        new_message_id = max_message_id + 1
+
+        cursor = conn.cursor()
+        cursor.execute(
+            '''INSERT INTO messages
+            (chat_id, from_user_id, message_id, message_type, caption, file_id, file_size, mime_type, duration)
+            VALUES (?, ?, ?, 'voice', ?, ?, ?, ?, ?)''',
+            (chat_id, user['id'], new_message_id, caption, file_id, file_size, voice.mimetype, duration)
+        )
+
+        message_id = cursor.lastrowid
+        conn.commit()
+
+        message = conn.execute('''
+            SELECT m.*, u.username, u.first_name, u.last_name
+            FROM messages m
+            JOIN users u ON m.from_user_id = u.id
+            WHERE m.id = ?
+        ''', (message_id,)).fetchone()
+
+        conn.close()
+
+        message_data = {
+            'message_id': message['message_id'],
+            'from': {
+                'id': message['from_user_id'],
+                'username': message['username'],
+                'first_name': message['first_name'],
+                'last_name': message['last_name']
+            },
+            'chat': {'id': chat_id},
+            'date': message['date'],
+            'message_type': message['message_type'],
+            'caption': message['caption'],
+            'voice': {
+                'file_id': message['file_id'],
+                'file_size': message['file_size'],
+                'duration': message['duration'],
+                'mime_type': message['mime_type']
+            }
+        }
+
+        return jsonify({'ok': True, 'result': message_data})
+
+    except Exception as e:
+        conn.close()
+        if os.path.exists(file_path):
+            os.remove(file_path)
+        return jsonify({
+            'ok': False,
+            'error_code': 500,
+            'description': f'Error uploading voice message: {str(e)}'
+        }), 500
+
+def send_animation(user: sqlite3.Row) -> JSONResponse:
+    if 'animation' not in request.files:
+        return jsonify({
+            'ok': False,
+            'error_code': 400,
+            'description': 'No animation provided'
+        }), 400
+
+    animation = request.files['animation']
+    chat_id = request.form.get('chat_id', type=int)
+    caption = request.form.get('caption', '')
+    duration = request.form.get('duration', type=int)
+
+    if not chat_id:
+        return jsonify({
+            'ok': False,
+            'error_code': 400,
+            'description': 'chat_id is required'
+        }), 400
+
+    if animation.filename == '':
+        return jsonify({
+            'ok': False,
+            'error_code': 400,
+            'description': 'No animation selected'
+        }), 400
+
+    conn = get_db_connection()
+
+    is_member = conn.execute(
+        'SELECT 1 FROM chat_members WHERE chat_id = ? AND user_id = ?',
+        (chat_id, user['id'])
+    ).fetchone()
+
+    if not is_member:
+        conn.close()
+        return jsonify({
+            'ok': False,
+            'error_code': 403,
+            'description': 'You are not a member of this chat'
+        }), 403
+
+    file_id = str(uuid.uuid4())
+    filename = f"{file_id}_{animation.filename}"
+    file_path = os.path.join(app.config['UPLOAD_FOLDER'], filename)
+
+    try:
+        animation.save(file_path)
+        file_size = os.path.getsize(file_path)
+
+        max_message_id = conn.execute(
+            'SELECT COALESCE(MAX(message_id), 0) as max_id FROM messages WHERE chat_id = ?',
+            (chat_id,)
+        ).fetchone()['max_id']
+        new_message_id = max_message_id + 1
+
+        cursor = conn.cursor()
+        cursor.execute(
+            '''INSERT INTO messages
+            (chat_id, from_user_id, message_id, message_type, caption, file_id, file_size, mime_type, duration)
+            VALUES (?, ?, ?, 'animation', ?, ?, ?, ?, ?)''',
+            (chat_id, user['id'], new_message_id, caption, file_id, file_size, animation.mimetype, duration)
+        )
+
+        message_id = cursor.lastrowid
+        conn.commit()
+
+        message = conn.execute('''
+            SELECT m.*, u.username, u.first_name, u.last_name
+            FROM messages m
+            JOIN users u ON m.from_user_id = u.id
+            WHERE m.id = ?
+        ''', (message_id,)).fetchone()
+
+        conn.close()
+
+        message_data = {
+            'message_id': message['message_id'],
+            'from': {
+                'id': message['from_user_id'],
+                'username': message['username'],
+                'first_name': message['first_name'],
+                'last_name': message['last_name']
+            },
+            'chat': {'id': chat_id},
+            'date': message['date'],
+            'message_type': message['message_type'],
+            'caption': message['caption'],
+            'animation': {
+                'file_id': message['file_id'],
+                'file_size': message['file_size'],
+                'duration': message['duration'],
+                'mime_type': message['mime_type']
+            }
+        }
+
+        return jsonify({'ok': True, 'result': message_data})
+
+    except Exception as e:
+        conn.close()
+        if os.path.exists(file_path):
+            os.remove(file_path)
+        return jsonify({
+            'ok': False,
+            'error_code': 500,
+            'description': f'Error uploading animation: {str(e)}'
+        }), 500
+
+def send_sticker(user: sqlite3.Row) -> JSONResponse:
+    if 'sticker' not in request.files:
+        return jsonify({
+            'ok': False,
+            'error_code': 400,
+            'description': 'No sticker provided'
+        }), 400
+
+    sticker = request.files['sticker']
+    chat_id = request.form.get('chat_id', type=int)
+
+    if not chat_id:
+        return jsonify({
+            'ok': False,
+            'error_code': 400,
+            'description': 'chat_id is required'
+        }), 400
+
+    if sticker.filename == '':
+        return jsonify({
+            'ok': False,
+            'error_code': 400,
+            'description': 'No sticker selected'
+        }), 400
+
+    conn = get_db_connection()
+
+    is_member = conn.execute(
+        'SELECT 1 FROM chat_members WHERE chat_id = ? AND user_id = ?',
+        (chat_id, user['id'])
+    ).fetchone()
+
+    if not is_member:
+        conn.close()
+        return jsonify({
+            'ok': False,
+            'error_code': 403,
+            'description': 'You are not a member of this chat'
+        }), 403
+
+    file_id = str(uuid.uuid4())
+    filename = f"{file_id}_{sticker.filename}"
+    file_path = os.path.join(app.config['UPLOAD_FOLDER'], filename)
+
+    try:
+        sticker.save(file_path)
+        file_size = os.path.getsize(file_path)
+
+        from PIL import Image
+        img = Image.open(file_path)
+        width, height = img.size
+
+        max_message_id = conn.execute(
+            'SELECT COALESCE(MAX(message_id), 0) as max_id FROM messages WHERE chat_id = ?',
+            (chat_id,)
+        ).fetchone()['max_id']
+        new_message_id = max_message_id + 1
+
+        cursor = conn.cursor()
+        cursor.execute(
+            '''INSERT INTO messages
+            (chat_id, from_user_id, message_id, message_type, file_id, file_size, mime_type, width, height)
+            VALUES (?, ?, ?, 'sticker', ?, ?, ?, ?, ?)''',
+            (chat_id, user['id'], new_message_id, file_id, file_size, sticker.mimetype, width, height)
+        )
+
+        message_id = cursor.lastrowid
+        conn.commit()
+
+        message = conn.execute('''
+            SELECT m.*, u.username, u.first_name, u.last_name
+            FROM messages m
+            JOIN users u ON m.from_user_id = u.id
+            WHERE m.id = ?
+        ''', (message_id,)).fetchone()
+
+        conn.close()
+
+        message_data = {
+            'message_id': message['message_id'],
+            'from': {
+                'id': message['from_user_id'],
+                'username': message['username'],
+                'first_name': message['first_name'],
+                'last_name': message['last_name']
+            },
+            'chat': {'id': chat_id},
+            'date': message['date'],
+            'message_type': message['message_type'],
+            'sticker': {
+                'file_id': message['file_id'],
+                'file_size': message['file_size'],
+                'width': message['width'],
+                'height': message['height']
+            }
+        }
+
+        return jsonify({'ok': True, 'result': message_data})
+
+    except Exception as e:
+        conn.close()
+        if os.path.exists(file_path):
+            os.remove(file_path)
+        return jsonify({
+            'ok': False,
+            'error_code': 500,
+            'description': f'Error uploading sticker: {str(e)}'
+        }), 500
+
+@validate_json({'chat_id': int, 'latitude': float, 'longitude': float})
+def send_location(user: sqlite3.Row) -> JSONResponse:
+    data = request.get_json()
+    chat_id = data['chat_id']
+    latitude = data['latitude']
+    longitude = data['longitude']
+
+    conn = get_db_connection()
+
+    is_member = conn.execute(
+        'SELECT 1 FROM chat_members WHERE chat_id = ? AND user_id = ?',
+        (chat_id, user['id'])
+    ).fetchone()
+
+    if not is_member:
+        conn.close()
+        return jsonify({
+            'ok': False,
+            'error_code': 403,
+            'description': 'You are not a member of this chat'
+        }), 403
+
+    try:
+        max_message_id = conn.execute(
+            'SELECT COALESCE(MAX(message_id), 0) as max_id FROM messages WHERE chat_id = ?',
+            (chat_id,)
+        ).fetchone()['max_id']
+        new_message_id = max_message_id + 1
+
+        cursor = conn.cursor()
+        cursor.execute(
+            '''INSERT INTO messages
+            (chat_id, from_user_id, message_id, message_type, text)
+            VALUES (?, ?, ?, 'location', ?)''',
+            (chat_id, user['id'], new_message_id, f"{latitude},{longitude}")
+        )
+
+        message_id = cursor.lastrowid
+        conn.commit()
+
+        message = conn.execute('''
+            SELECT m.*, u.username, u.first_name, u.last_name
+            FROM messages m
+            JOIN users u ON m.from_user_id = u.id
+            WHERE m.id = ?
+        ''', (message_id,)).fetchone()
+
+        conn.close()
+
+        message_data = {
+            'message_id': message['message_id'],
+            'from': {
+                'id': message['from_user_id'],
+                'username': message['username'],
+                'first_name': message['first_name'],
+                'last_name': message['last_name']
+            },
+            'chat': {'id': chat_id},
+            'date': message['date'],
+            'message_type': message['message_type'],
+            'location': {
+                'latitude': latitude,
+                'longitude': longitude
+            }
+        }
+
+        return jsonify({'ok': True, 'result': message_data})
+
+    except sqlite3.Error as e:
+        conn.close()
+        return jsonify({
+            'ok': False,
+            'error_code': 500,
+            'description': f'Database error: {str(e)}'
+        }), 500
+
+@validate_json({'chat_id': int, 'phone_number': str, 'first_name': str, 'last_name': str})
+def send_contact(user: sqlite3.Row) -> JSONResponse:
+    data = request.get_json()
+    chat_id = data['chat_id']
+    phone_number = data['phone_number']
+    first_name = data['first_name']
+    last_name = data.get('last_name', '')
+
+    conn = get_db_connection()
+
+    is_member = conn.execute(
+        'SELECT 1 FROM chat_members WHERE chat_id = ? AND user_id = ?',
+        (chat_id, user['id'])
+    ).fetchone()
+
+    if not is_member:
+        conn.close()
+        return jsonify({
+            'ok': False,
+            'error_code': 403,
+            'description': 'You are not a member of this chat'
+        }), 403
+
+    try:
+        max_message_id = conn.execute(
+            'SELECT COALESCE(MAX(message_id), 0) as max_id FROM messages WHERE chat_id = ?',
+            (chat_id,)
+        ).fetchone()['max_id']
+        new_message_id = max_message_id + 1
+
+        cursor = conn.cursor()
+        cursor.execute(
+            '''INSERT INTO messages
+            (chat_id, from_user_id, message_id, message_type, text)
+            VALUES (?, ?, ?, 'contact', ?)''',
+            (chat_id, user['id'], new_message_id, f"{phone_number}|{first_name}|{last_name}")
+        )
+
+        message_id = cursor.lastrowid
+        conn.commit()
+
+        message = conn.execute('''
+            SELECT m.*, u.username, u.first_name, u.last_name
+            FROM messages m
+            JOIN users u ON m.from_user_id = u.id
+            WHERE m.id = ?
+        ''', (message_id,)).fetchone()
+
+        conn.close()
+
+        message_data = {
+            'message_id': message['message_id'],
+            'from': {
+                'id': message['from_user_id'],
+                'username': message['username'],
+                'first_name': message['first_name'],
+                'last_name': message['last_name']
+            },
+            'chat': {'id': chat_id},
+            'date': message['date'],
+            'message_type': message['message_type'],
+            'contact': {
+                'phone_number': phone_number,
+                'first_name': first_name,
+                'last_name': last_name
+            }
+        }
+
+        return jsonify({'ok': True, 'result': message_data})
+
+    except sqlite3.Error as e:
+        conn.close()
+        return jsonify({
+            'ok': False,
+            'error_code': 500,
+            'description': f'Database error: {str(e)}'
+        }), 500
+
+@validate_json({'chat_id': int, 'question': str, 'options': list, 'is_anonymous': bool})
+def send_poll(user: sqlite3.Row) -> JSONResponse:
+    data = request.get_json()
+    chat_id = data['chat_id']
+    question = data['question']
+    options = data['options']
+    is_anonymous = data.get('is_anonymous', True)
+
+    if len(options) < 2 or len(options) > 10:
+        return jsonify({
+            'ok': False,
+            'error_code': 400,
+            'description': 'Poll must have between 2 and 10 options'
+        }), 400
+
+    conn = get_db_connection()
+
+    is_member = conn.execute(
+        'SELECT 1 FROM chat_members WHERE chat_id = ? AND user_id = ?',
+        (chat_id, user['id'])
+    ).fetchone()
+
+    if not is_member:
+        conn.close()
+        return jsonify({
+            'ok': False,
+            'error_code': 403,
+            'description': 'You are not a member of this chat'
+        }), 403
+
+    try:
+        max_message_id = conn.execute(
+            'SELECT COALESCE(MAX(message_id), 0) as max_id FROM messages WHERE chat_id = ?',
+            (chat_id,)
+        ).fetchone()['max_id']
+        new_message_id = max_message_id + 1
+
+        cursor = conn.cursor()
+        cursor.execute(
+            '''INSERT INTO messages
+            (chat_id, from_user_id, message_id, message_type, text)
+            VALUES (?, ?, ?, 'poll', ?)''',
+            (chat_id, user['id'], new_message_id, f"{question}|{','.join(options)}|{is_anonymous}")
+        )
+
+        message_id = cursor.lastrowid
+        conn.commit()
+
+        message = conn.execute('''
+            SELECT m.*, u.username, u.first_name, u.last_name
+            FROM messages m
+            JOIN users u ON m.from_user_id = u.id
+            WHERE m.id = ?
+        ''', (message_id,)).fetchone()
+
+        conn.close()
+
+        message_data = {
+            'message_id': message['message_id'],
+            'from': {
+                'id': message['from_user_id'],
+                'username': message['username'],
+                'first_name': message['first_name'],
+                'last_name': message['last_name']
+            },
+            'chat': {'id': chat_id},
+            'date': message['date'],
+            'message_type': message['message_type'],
+            'poll': {
+                'question': question,
+                'options': options,
+                'is_anonymous': is_anonymous
+            }
+        }
+
+        return jsonify({'ok': True, 'result': message_data})
+
+    except sqlite3.Error as e:
+        conn.close()
+        return jsonify({
+            'ok': False,
+            'error_code': 500,
+            'description': f'Database error: {str(e)}'
+        }), 500
+
+@validate_json({'chat_id': int, 'emoji': str})
+def send_dice(user: sqlite3.Row) -> JSONResponse:
+    data = request.get_json()
+    chat_id = data['chat_id']
+    emoji = data['emoji']
+
+    valid_emojis = ['🎲', '🎯', '🏀', '⚽', '🎳', '🎰']
+    if emoji not in valid_emojis:
+        return jsonify({
+            'ok': False,
+            'error_code': 400,
+            'description': f'Invalid emoji. Must be one of: {", ".join(valid_emojis)}'
+        }), 400
+
+    conn = get_db_connection()
+
+    is_member = conn.execute(
+        'SELECT 1 FROM chat_members WHERE chat_id = ? AND user_id = ?',
+        (chat_id, user['id'])
+    ).fetchone()
+
+    if not is_member:
+        conn.close()
+        return jsonify({
+            'ok': False,
+            'error_code': 403,
+            'description': 'You are not a member of this chat'
+        }), 403
+
+    import random
+    if emoji == '🎲':
+        value = random.randint(1, 6)
+    elif emoji == '🎯':
+        value = random.randint(1, 6)
+    elif emoji == '🏀':
+        value = random.randint(1, 5)
+    elif emoji == '⚽':
+        value = random.randint(1, 5)
+    elif emoji == '🎳':
+        value = random.randint(1, 6)
+    elif emoji == '🎰':
+        value = random.randint(1, 64)
+
+    try:
+        max_message_id = conn.execute(
+            'SELECT COALESCE(MAX(message_id), 0) as max_id FROM messages WHERE chat_id = ?',
+            (chat_id,)
+        ).fetchone()['max_id']
+        new_message_id = max_message_id + 1
+
+        cursor = conn.cursor()
+        cursor.execute(
+            '''INSERT INTO messages
+            (chat_id, from_user_id, message_id, message_type, text)
+            VALUES (?, ?, ?, 'dice', ?)''',
+            (chat_id, user['id'], new_message_id, f"{emoji}|{value}")
+        )
+
+        message_id = cursor.lastrowid
+        conn.commit()
+
+        message = conn.execute('''
+            SELECT m.*, u.username, u.first_name, u.last_name
+            FROM messages m
+            JOIN users u ON m.from_user_id = u.id
+            WHERE m.id = ?
+        ''', (message_id,)).fetchone()
+
+        conn.close()
+
+        message_data = {
+            'message_id': message['message_id'],
+            'from': {
+                'id': message['from_user_id'],
+                'username': message['username'],
+                'first_name': message['first_name'],
+                'last_name': message['last_name']
+            },
+            'chat': {'id': chat_id},
+            'date': message['date'],
+            'message_type': message['message_type'],
+            'dice': {
+                'emoji': emoji,
+                'value': value
+            }
+        }
+
+        return jsonify({'ok': True, 'result': message_data})
+
+    except sqlite3.Error as e:
+        conn.close()
+        return jsonify({
+            'ok': False,
+            'error_code': 500,
+            'description': f'Database error: {str(e)}'
+        }), 500
+
 def get_user(user: sqlite3.Row) -> JSONResponse:
-    """Get information about a user."""
-    user_id = request.args.get('user_id')
+    user_id = request.args.get('user_id', type=int)
+
     if not user_id:
         return jsonify({
             'ok': False,
@@ -642,44 +4258,40 @@ def get_user(user: sqlite3.Row) -> JSONResponse:
         }), 400
 
     conn = get_db_connection()
+
     target_user = conn.execute(
-        'SELECT id, username, first_name, last_name, phone, is_bot, last_seen, is_online FROM users WHERE id = ?',
+        'SELECT * FROM users WHERE id = ?',
         (user_id,)
     ).fetchone()
 
-    conn.close()
-
     if not target_user:
+        conn.close()
         return jsonify({
             'ok': False,
             'error_code': 404,
             'description': 'User not found'
         }), 404
 
-    is_blocked = check_if_blocked(user['id'], int(user_id))
+    user_data = {
+        'id': target_user['id'],
+        'username': target_user['username'],
+        'first_name': target_user['first_name'],
+        'last_name': target_user['last_name'],
+        'phone_number': target_user['phone_number'],
+        'is_bot': bool(target_user['is_bot']),
+        'is_online': bool(target_user['is_online']),
+        'last_seen': target_user['last_seen']
+    }
 
-    return jsonify({
-        'ok': True,
-        'result': {
-            'id': target_user['id'],
-            'is_bot': bool(target_user['is_bot']),
-            'first_name': target_user['first_name'],
-            'last_name': target_user['last_name'],
-            'username': target_user['username'],
-            'phone': target_user['phone'],
-            'is_online': bool(target_user['is_online']),
-            'last_seen': target_user['last_seen'],
-            'is_blocked': is_blocked
-        }
-    })
+    conn.close()
+    return jsonify({'ok': True, 'result': user_data})
 
-@token_required
 @validate_json({'user_id': int})
 def block_user(user: sqlite3.Row) -> JSONResponse:
-    """Block a user."""
-    user_id_to_block = request.json['user_id']
+    data = request.get_json()
+    user_id_to_block = data['user_id']
 
-    if user['id'] == user_id_to_block:
+    if user_id_to_block == user['id']:
         return jsonify({
             'ok': False,
             'error_code': 400,
@@ -710,522 +4322,197 @@ def block_user(user: sqlite3.Row) -> JSONResponse:
         conn.close()
         return jsonify({
             'ok': False,
-            'error_code': 400,
-            'description': 'User is already blocked'
-        }), 400
+            'error_code': 409,
+            'description': 'User already blocked'
+        }), 409
 
-    conn.execute(
-        'INSERT INTO blocked_users (user_id, blocked_user_id) VALUES (?, ?)',
-        (user['id'], user_id_to_block)
-    )
+    try:
+        conn.execute(
+            'INSERT INTO blocked_users (user_id, blocked_user_id) VALUES (?, ?)',
+            (user['id'], user_id_to_block)
+        )
+        conn.commit()
+        conn.close()
 
-    conn.commit()
-    conn.close()
+        return jsonify({
+            'ok': True,
+            'result': {
+                'success': True,
+                'description': 'User blocked successfully'
+            }
+        })
 
-    return jsonify({
-        'ok': True,
-        'result': 'User blocked successfully'
-    })
+    except sqlite3.Error as e:
+        conn.close()
+        return jsonify({
+            'ok': False,
+            'error_code': 500,
+            'description': f'Database error: {str(e)}'
+        }), 500
 
-@token_required
 @validate_json({'user_id': int})
 def unblock_user(user: sqlite3.Row) -> JSONResponse:
-    """Unblock a user."""
-    user_id_to_unblock = request.json['user_id']
+    data = request.get_json()
+    user_id_to_unblock = data['user_id']
 
     conn = get_db_connection()
 
-    result = conn.execute(
-        'DELETE FROM blocked_users WHERE user_id = ? AND blocked_user_id = ?',
+    existing_block = conn.execute(
+        'SELECT id FROM blocked_users WHERE user_id = ? AND blocked_user_id = ?',
         (user['id'], user_id_to_unblock)
-    )
+    ).fetchone()
 
-    conn.commit()
-    conn.close()
-
-    if result.rowcount == 0:
+    if not existing_block:
+        conn.close()
         return jsonify({
             'ok': False,
             'error_code': 404,
-            'description': 'User was not blocked'
+            'description': 'User is not blocked'
         }), 404
 
-    return jsonify({
-        'ok': True,
-        'result': 'User unblocked successfully'
-    })
+    try:
+        conn.execute(
+            'DELETE FROM blocked_users WHERE user_id = ? AND blocked_user_id = ?',
+            (user['id'], user_id_to_unblock)
+        )
+        conn.commit()
+        conn.close()
 
-@token_required
+        return jsonify({
+            'ok': True,
+            'result': {
+                'success': True,
+                'description': 'User unblocked successfully'
+            }
+        })
+
+    except sqlite3.Error as e:
+        conn.close()
+        return jsonify({
+            'ok': False,
+            'error_code': 500,
+            'description': f'Database error: {str(e)}'
+        }), 500
+
 def get_blocked_users(user: sqlite3.Row) -> JSONResponse:
-    """Get list of blocked users."""
     conn = get_db_connection()
 
     blocked_users = conn.execute('''
-        SELECT u.id, u.username, u.first_name, u.last_name, u.phone
+        SELECT u.id, u.username, u.first_name, u.last_name, u.phone_number
         FROM blocked_users b
         JOIN users u ON b.blocked_user_id = u.id
         WHERE b.user_id = ?
-        ORDER BY b.created_at DESC
+        ORDER BY u.first_name, u.last_name
     ''', (user['id'],)).fetchall()
-
-    conn.close()
 
     result = []
     for blocked_user in blocked_users:
-        result.append({
+        user_data = {
             'id': blocked_user['id'],
             'username': blocked_user['username'],
             'first_name': blocked_user['first_name'],
             'last_name': blocked_user['last_name'],
-            'phone': blocked_user['phone']
-        })
+            'phone_number': blocked_user['phone_number']
+        }
+        result.append(user_data)
 
+    conn.close()
     return jsonify({'ok': True, 'result': result})
 
-@token_required
-@validate_json({
-    'type': str,
-    'title': str
-})
-def create_chat(user: sqlite3.Row) -> JSONResponse:
-    """Create a new chat."""
-    chat_type = request.json['type']
-    title = request.json['title']
-    description = request.json.get('description', '')
+def search_messages(user: sqlite3.Row) -> JSONResponse:
+    query = request.args.get('query', '')
+    chat_id = request.args.get('chat_id', type=int)
+    limit = request.args.get('limit', 50, type=int)
+    offset = request.args.get('offset', 0, type=int)
 
-    if chat_type not in ['private', 'group', 'channel', 'supergroup']:
+    if not query:
         return jsonify({
             'ok': False,
             'error_code': 400,
-            'description': 'Invalid chat type'
+            'description': 'query parameter is required'
         }), 400
-
-    conn = get_db_connection()
-
-    invite_link = str(uuid.uuid4())
-
-    conn.execute('''
-        INSERT INTO chats (type, title, description, invite_link, created_by)
-        VALUES (?, ?, ?, ?, ?)
-    ''', (chat_type, title, description, invite_link, user['id']))
-
-    chat_id = conn.execute('SELECT last_insert_rowid()').fetchone()[0]
-
-    conn.execute('''
-        INSERT INTO chat_members (chat_id, user_id, status)
-        VALUES (?, ?, 'creator')
-    ''', (chat_id, user['id']))
-
-    conn.commit()
-
-    new_chat = conn.execute(
-        'SELECT * FROM chats WHERE id = ?',
-        (chat_id,)
-    ).fetchone()
-
-    conn.close()
-
-    return jsonify({
-        'ok': True,
-        'result': {
-            'id': new_chat['id'],
-            'type': new_chat['type'],
-            'title': new_chat['title'],
-            'description': new_chat['description'],
-            'invite_link': new_chat['invite_link'],
-            'created_by': new_chat['created_by'],
-            'created_at': new_chat['created_at']
-        }
-    })
-
-@token_required
-def get_chat(user: sqlite3.Row) -> JSONResponse:
-    """Get information about a chat."""
-    chat_id = request.args.get('chat_id')
-    if not chat_id:
-        return jsonify({
-            'ok': False,
-            'error_code': 400,
-            'description': 'chat_id parameter is required'
-        }), 400
-
-    conn = get_db_connection()
-
-    membership = conn.execute(
-        'SELECT * FROM chat_members WHERE chat_id = ? AND user_id = ?',
-        (chat_id, user['id'])
-    ).fetchone()
-
-    if not membership:
-        conn.close()
-        return jsonify({
-            'ok': False,
-            'error_code': 403,
-            'description': 'Not a member of this chat'
-        }), 403
-
-    chat = conn.execute(
-        'SELECT * FROM chats WHERE id = ?',
-        (chat_id,)
-    ).fetchone()
-
-    if not chat:
-        conn.close()
-        return jsonify({
-            'ok': False,
-            'error_code': 404,
-            'description': 'Chat not found'
-        }), 404
-
-    members_count = conn.execute(
-        'SELECT COUNT(*) FROM chat_members WHERE chat_id = ? AND status != "left" AND status != "kicked"',
-        (chat_id,)
-    ).fetchone()[0]
-
-    online_count = conn.execute('''
-        SELECT COUNT(*)
-        FROM chat_members cm
-        JOIN users u ON cm.user_id = u.id
-        WHERE cm.chat_id = ? AND u.is_online = TRUE
-    ''', (chat_id,)).fetchone()[0]
-
-    conn.close()
-
-    return jsonify({
-        'ok': True,
-        'result': {
-            'id': chat['id'],
-            'type': chat['type'],
-            'title': chat['title'],
-            'description': chat['description'],
-            'invite_link': chat['invite_link'],
-            'created_by': chat['created_by'],
-            'created_at': chat['created_at'],
-            'is_public': bool(chat['is_public']),
-            'members_count': members_count,
-            'online_count': online_count
-        }
-    })
-
-@token_required
-@validate_json({'chat_id': int})
-def join_chat(user: sqlite3.Row) -> JSONResponse:
-    """Join a chat by ID or invite link."""
-    chat_id = request.json.get('chat_id')
-    invite_link = request.json.get('invite_link')
 
     conn = get_db_connection()
 
     if chat_id:
-        chat = conn.execute(
-            'SELECT * FROM chats WHERE id = ?',
-            (chat_id,)
+        is_member = conn.execute(
+            'SELECT 1 FROM chat_members WHERE chat_id = ? AND user_id = ?',
+            (chat_id, user['id'])
         ).fetchone()
-    elif invite_link:
-        chat = conn.execute(
-            'SELECT * FROM chats WHERE invite_link = ?',
-            (invite_link,)
-        ).fetchone()
-    else:
-        conn.close()
-        return jsonify({
-            'ok': False,
-            'error_code': 400,
-            'description': 'Either chat_id or invite_link is required'
-        }), 400
 
-    if not chat:
-        conn.close()
-        return jsonify({
-            'ok': False,
-            'error_code': 404,
-            'description': 'Chat not found'
-        }), 404
-
-    if not chat['is_public'] and not invite_link:
-        conn.close()
-        return jsonify({
-            'ok': False,
-            'error_code': 403,
-            'description': 'This chat is private and requires an invite link'
-        }), 403
-
-    existing_member = conn.execute(
-        'SELECT * FROM chat_members WHERE chat_id = ? AND user_id = ?',
-        (chat['id'], user['id'])
-    ).fetchone()
-
-    if existing_member:
-        if existing_member['status'] in ['left', 'kicked']:
-            conn.execute('''
-                UPDATE chat_members
-                SET status = 'member', joined_date = CURRENT_TIMESTAMP
-                WHERE chat_id = ? AND user_id = ?
-            ''', (chat['id'], user['id']))
-        else:
+        if not is_member:
             conn.close()
             return jsonify({
                 'ok': False,
-                'error_code': 400,
-                'description': 'Already a member of this chat'
-            }), 400
+                'error_code': 403,
+                'description': 'You are not a member of this chat'
+            }), 403
+
+        messages = conn.execute('''
+            SELECT m.*, u.username, u.first_name, u.last_name
+            FROM messages m
+            JOIN users u ON m.from_user_id = u.id
+            WHERE m.chat_id = ? AND (m.text LIKE ? OR m.caption LIKE ?)
+            ORDER BY m.date DESC
+            LIMIT ? OFFSET ?
+        ''', (chat_id, f'%{query}%', f'%{query}%', limit, offset)).fetchall()
     else:
-        conn.execute('''
-            INSERT INTO chat_members (chat_id, user_id, status)
-            VALUES (?, ?, 'member')
-        ''', (chat['id'], user['id']))
+        messages = conn.execute('''
+            SELECT m.*, u.username, u.first_name, u.last_name, c.title as chat_title
+            FROM messages m
+            JOIN users u ON m.from_user_id = u.id
+            JOIN chats c ON m.chat_id = c.id
+            JOIN chat_members cm ON m.chat_id = cm.chat_id AND cm.user_id = ?
+            WHERE (m.text LIKE ? OR m.caption LIKE ?)
+            ORDER BY m.date DESC
+            LIMIT ? OFFSET ?
+        ''', (user['id'], f'%{query}%', f'%{query}%', limit, offset)).fetchall()
 
-    conn.commit()
-    conn.close()
-
-    return jsonify({
-        'ok': True,
-        'result': 'Joined chat successfully'
-    })
-
-@token_required
-@validate_json({'chat_id': int})
-def leave_chat(user: sqlite3.Row) -> JSONResponse:
-    """Leave a chat."""
-    chat_id = request.json['chat_id']
-
-    conn = get_db_connection()
-
-    membership = conn.execute(
-        'SELECT * FROM chat_members WHERE chat_id = ? AND user_id = ?',
-        (chat_id, user['id'])
-    ).fetchone()
-
-    if not membership:
-        conn.close()
-        return jsonify({
-            'ok': False,
-            'error_code': 400,
-            'description': 'Not a member of this chat'
-        }), 400
-
-    conn.execute('''
-        UPDATE chat_members
-        SET status = 'left'
-        WHERE chat_id = ? AND user_id = ?
-    ''', (chat_id, user['id']))
-
-    conn.commit()
-    conn.close()
-
-    return jsonify({
-        'ok': True,
-        'result': 'Left chat successfully'
-    })
-
-@token_required
-@validate_json({'chat_id': int})
-def delete_chat(user: sqlite3.Row) -> JSONResponse:
-    """Delete a chat (only for creators)."""
-    chat_id = request.json['chat_id']
-
-    conn = get_db_connection()
-
-    chat = conn.execute(
-        'SELECT * FROM chats WHERE id = ? AND created_by = ?',
-        (chat_id, user['id'])
-    ).fetchone()
-
-    if not chat:
-        conn.close()
-        return jsonify({
-            'ok': False,
-            'error_code': 404,
-            'description': 'Chat not found or you are not the creator'
-        }), 404
-
-    conn.execute('DELETE FROM chats WHERE id = ?', (chat_id,))
-
-    conn.commit()
-    conn.close()
-
-    return jsonify({
-        'ok': True,
-        'result': 'Chat deleted successfully'
-    })
-
-@token_required
-@validate_json({'chat_id': int, 'text': str})
-def send_message(user: sqlite3.Row) -> JSONResponse:
-    """Send a text message to a chat."""
-    chat_id = request.json['chat_id']
-    text = request.json['text']
-    reply_to_message_id = request.json.get('reply_to_message_id')
-
-    if len(text) > 4096:
-        return jsonify({
-            'ok': False,
-            'error_code': 400,
-            'description': 'Message is too long (max 4096 characters)'
-        }), 400
-
-    conn = get_db_connection()
-
-    membership = conn.execute('''
-        SELECT * FROM chat_members
-        WHERE chat_id = ? AND user_id = ?
-        AND status NOT IN ('kicked', 'left')
-        AND can_send_messages = TRUE
-    ''', (chat_id, user['id'])).fetchone()
-
-    if not membership:
-        conn.close()
-        return jsonify({
-            'ok': False,
-            'error_code': 403,
-            'description': 'Not allowed to send messages in this chat'
-        }), 403
-
-    if reply_to_message_id:
-        replied_message = conn.execute(
-            'SELECT * FROM messages WHERE chat_id = ? AND message_id = ?',
-            (chat_id, reply_to_message_id)
-        ).fetchone()
-
-        if not replied_message:
-            conn.close()
-            return jsonify({
-                'ok': False,
-                'error_code': 400,
-                'description': 'Replied message not found'
-            }), 400
-
-    last_message = conn.execute(
-        'SELECT MAX(message_id) FROM messages WHERE chat_id = ?',
-        (chat_id,)
-    ).fetchone()
-
-    new_message_id = last_message[0] + 1 if last_message[0] else 1
-
-    conn.execute('''
-        INSERT INTO messages (chat_id, from_user_id, text, message_id, reply_to_message_id, media_type)
-        VALUES (?, ?, ?, ?, ?, 'text')
-    ''', (chat_id, user['id'], text, new_message_id, reply_to_message_id))
-
-    conn.commit()
-
-    sent_message = conn.execute('''
-        SELECT m.*, u.username, u.first_name, u.last_name
-        FROM messages m
-        JOIN users u ON m.from_user_id = u.id
-        WHERE m.chat_id = ? AND m.message_id = ?
-    ''', (chat_id, new_message_id)).fetchone()
-
-    conn.close()
-
-    return jsonify({
-        'ok': True,
-        'result': format_message(sent_message)
-    })
-
-@token_required
-def get_messages(user: sqlite3.Row) -> JSONResponse:
-    """Get messages from a chat."""
-    chat_id = request.args.get('chat_id')
-    limit = min(int(request.args.get('limit', 100)), 1000)
-    offset = int(request.args.get('offset', 0))
-
-    if not chat_id:
-        return jsonify({
-            'ok': False,
-            'error_code': 400,
-            'description': 'chat_id parameter is required'
-        }), 400
-
-    conn = get_db_connection()
-
-    membership = conn.execute(
-        'SELECT * FROM chat_members WHERE chat_id = ? AND user_id = ? AND status NOT IN ("left", "kicked")',
-        (chat_id, user['id'])
-    ).fetchone()
-
-    if not membership:
-        conn.close()
-        return jsonify({
-            'ok': False,
-            'error_code': 403,
-            'description': 'Not a member of this chat'
-        }), 403
-
-    messages = conn.execute('''
-        SELECT m.*, u.username, u.first_name, u.last_name
-        FROM messages m
-        JOIN users u ON m.from_user_id = u.id
-        WHERE m.chat_id = ?
-        ORDER BY m.date DESC
-        LIMIT ? OFFSET ?
-    ''', (chat_id, limit, offset)).fetchall()
-
-    result = [format_message(msg) for msg in messages]
+    result = []
+    for msg in messages:
+        message_data = {
+            'message_id': msg['message_id'],
+            'from': {
+                'id': msg['from_user_id'],
+                'username': msg['username'],
+                'first_name': msg['first_name'],
+                'last_name': msg['last_name']
+            },
+            'chat': {
+                'id': msg['chat_id'],
+                'title': msg.get('chat_title', '')
+            },
+            'date': msg['date'],
+            'text': msg['text'],
+            'message_type': msg['message_type'],
+            'caption': msg['caption'],
+            'file_id': msg['file_id']
+        }
+        result.append(message_data)
 
     conn.close()
     return jsonify({'ok': True, 'result': result})
 
-@token_required
-@validate_json({'chat_id': int, 'message_id': int, 'text': str})
-def edit_message_text(user: sqlite3.Row) -> JSONResponse:
-    """Edit a text message."""
-    chat_id = request.json['chat_id']
-    message_id = request.json['message_id']
-    new_text = request.json['text']
-
-    if len(new_text) > 4096:
-        return jsonify({
-            'ok': False,
-            'error_code': 400,
-            'description': 'Message is too long (max 4096 characters)'
-        }), 400
+@validate_json({'chat_id': int, 'message_id': int})
+def read_message(user: sqlite3.Row) -> JSONResponse:
+    data = request.get_json()
+    chat_id = data['chat_id']
+    message_id = data['message_id']
 
     conn = get_db_connection()
 
-    message = conn.execute(
-        'SELECT * FROM messages WHERE chat_id = ? AND message_id = ? AND from_user_id = ?',
-        (chat_id, message_id, user['id'])
+    is_member = conn.execute(
+        'SELECT 1 FROM chat_members WHERE chat_id = ? AND user_id = ?',
+        (chat_id, user['id'])
     ).fetchone()
 
-    if not message:
+    if not is_member:
         conn.close()
         return jsonify({
             'ok': False,
-            'error_code': 404,
-            'description': 'Message not found or not authorized to edit'
-        }), 404
-
-    conn.execute('''
-        UPDATE messages
-        SET text = ?, edit_date = CURRENT_TIMESTAMP
-        WHERE chat_id = ? AND message_id = ?
-    ''', (new_text, chat_id, message_id))
-
-    conn.commit()
-
-    updated_message = conn.execute('''
-        SELECT m.*, u.username, u.first_name, u.last_name
-        FROM messages m
-        JOIN users u ON m.from_user_id = u.id
-        WHERE m.chat_id = ? AND m.message_id = ?
-    ''', (chat_id, message_id)).fetchone()
-
-    conn.close()
-
-    return jsonify({
-        'ok': True,
-        'result': format_message(updated_message)
-    })
-
-@token_required
-@validate_json({'chat_id': int, 'message_id': int})
-def delete_message(user: sqlite3.Row) -> JSONResponse:
-    """Delete a message."""
-    chat_id = request.json['chat_id']
-    message_id = request.json['message_id']
-
-    conn = get_db_connection()
+            'error_code': 403,
+            'description': 'You are not a member of this chat'
+        }), 403
 
     message = conn.execute(
         'SELECT * FROM messages WHERE chat_id = ? AND message_id = ?',
@@ -1240,227 +4527,164 @@ def delete_message(user: sqlite3.Row) -> JSONResponse:
             'description': 'Message not found'
         }), 404
 
-    is_author = message['from_user_id'] == user['id']
+    try:
+        existing_read = conn.execute(
+            'SELECT * FROM message_read_status WHERE message_id = ? AND user_id = ?',
+            (message['id'], user['id'])
+        ).fetchone()
 
-    if not is_author:
-        user_permissions = conn.execute('''
-            SELECT can_delete_messages FROM chat_members
-            WHERE chat_id = ? AND user_id = ? AND status IN ('creator', 'administrator')
-        ''', (chat_id, user['id'])).fetchone()
+        if not existing_read:
+            conn.execute(
+                'INSERT INTO message_read_status (message_id, user_id) VALUES (?, ?)',
+                (message['id'], user['id'])
+            )
+            conn.commit()
 
-        if not user_permissions or not user_permissions['can_delete_messages']:
+        conn.close()
+
+        return jsonify({
+            'ok': True,
+            'result': {
+                'success': True,
+                'description': 'Message marked as read'
+            }
+        })
+
+    except sqlite3.Error as e:
+        conn.close()
+        return jsonify({
+            'ok': False,
+            'error_code': 500,
+            'description': f'Database error: {str(e)}'
+        }), 500
+
+def get_unread_count(user: sqlite3.Row) -> JSONResponse:
+    chat_id = request.args.get('chat_id', type=int)
+
+    conn = get_db_connection()
+
+    if chat_id:
+        is_member = conn.execute(
+            'SELECT 1 FROM chat_members WHERE chat_id = ? AND user_id = ?',
+            (chat_id, user['id'])
+        ).fetchone()
+
+        if not is_member:
             conn.close()
             return jsonify({
                 'ok': False,
                 'error_code': 403,
-                'description': 'Not authorized to delete this message'
+                'description': 'You are not a member of this chat'
             }), 403
 
-    conn.execute(
-        'DELETE FROM messages WHERE chat_id = ? AND message_id = ?',
-        (chat_id, message_id)
-    )
+        count = conn.execute('''
+            SELECT COUNT(*) as count
+            FROM messages m
+            WHERE m.chat_id = ?
+            AND m.id NOT IN (
+                SELECT message_id FROM message_read_status WHERE user_id = ?
+            )
+        ''', (chat_id, user['id'])).fetchone()['count']
+    else:
+        count = conn.execute('''
+            SELECT COUNT(*) as count
+            FROM messages m
+            JOIN chat_members cm ON m.chat_id = cm.chat_id AND cm.user_id = ?
+            WHERE m.id NOT IN (
+                SELECT message_id FROM message_read_status WHERE user_id = ?
+            )
+        ''', (user['id'], user['id'])).fetchone()['count']
 
-    conn.commit()
     conn.close()
+    return jsonify({'ok': True, 'result': count})
 
-    return jsonify({
-        'ok': True,
-        'result': 'Message deleted successfully'
-    })
+def set_user_profile_photo(user: sqlite3.Row) -> JSONResponse:
+    if 'photo' not in request.files:
+        return jsonify({
+            'ok': False,
+            'error_code': 400,
+            'description': 'No photo provided'
+        }), 400
 
-@token_required
-def get_contacts(user: sqlite3.Row) -> JSONResponse:
-    """Get user's contact list."""
-    conn = get_db_connection()
+    photo = request.files['photo']
 
-    contacts = conn.execute('''
-        SELECT u.id, u.username, u.first_name, u.last_name, u.phone, u.is_online, u.last_seen
-        FROM contacts c
-        JOIN users u ON c.contact_user_id = u.id
-        WHERE c.user_id = ?
-        ORDER BY u.first_name, u.last_name
-    ''', (user['id'],)).fetchall()
+    if photo.filename == '':
+        return jsonify({
+            'ok': False,
+            'error_code': 400,
+            'description': 'No photo selected'
+        }), 400
 
-    result = []
-    for contact in contacts:
-        result.append({
-            'id': contact['id'],
-            'username': contact['username'],
-            'first_name': contact['first_name'],
-            'last_name': contact['last_name'],
-            'phone': contact['phone'],
-            'is_online': bool(contact['is_online']),
-            'last_seen': contact['last_seen']
+    file_id = str(uuid.uuid4())
+    filename = f"{file_id}_{photo.filename}"
+    file_path = os.path.join(app.config['UPLOAD_FOLDER'], filename)
+
+    try:
+        photo.save(file_path)
+        file_size = os.path.getsize(file_path)
+
+        from PIL import Image
+        img = Image.open(file_path)
+        width, height = img.size
+
+        conn = get_db_connection()
+
+        conn.execute(
+            'UPDATE user_profile_photos SET is_current = FALSE WHERE user_id = ?',
+            (user['id'],)
+        )
+
+        conn.execute(
+            '''INSERT INTO user_profile_photos
+            (user_id, file_id, file_size, width, height, is_current)
+            VALUES (?, ?, ?, ?, ?, TRUE)''',
+            (user['id'], file_id, file_size, width, height)
+        )
+        conn.commit()
+        conn.close()
+
+        return jsonify({
+            'ok': True,
+            'result': {
+                'success': True,
+                'description': 'Profile photo updated successfully'
+            }
         })
 
-    conn.close()
-    return jsonify({'ok': True, 'result': result})
-
-@token_required
-@validate_json({'user_id': int})
-def add_contact(user: sqlite3.Row) -> JSONResponse:
-    """Add a user to contacts."""
-    contact_user_id = request.json['user_id']
-
-    if user['id'] == contact_user_id:
+    except Exception as e:
+        if os.path.exists(file_path):
+            os.remove(file_path)
         return jsonify({
             'ok': False,
-            'error_code': 400,
-            'description': 'Cannot add yourself as a contact'
-        }), 400
+            'error_code': 500,
+            'description': f'Error uploading profile photo: {str(e)}'
+        }), 500
+
+@validate_json({'chat_id': int, 'user_id': int, 'custom_title': str})
+def set_member_custom_title(user: sqlite3.Row) -> JSONResponse:
+    data = request.get_json()
+    chat_id = data['chat_id']
+    user_id = data['user_id']
+    custom_title = data['custom_title']
 
     conn = get_db_connection()
 
-    contact_user = conn.execute(
-        'SELECT * FROM users WHERE id = ?',
-        (contact_user_id,)
-    ).fetchone()
-
-    if not contact_user:
-        conn.close()
-        return jsonify({
-            'ok': False,
-            'error_code': 404,
-            'description': 'User not found'
-        }), 404
-
-    existing_contact = conn.execute(
-        'SELECT * FROM contacts WHERE user_id = ? AND contact_user_id = ?',
-        (user['id'], contact_user_id)
-    ).fetchone()
-
-    if existing_contact:
-        conn.close()
-        return jsonify({
-            'ok': False,
-            'error_code': 400,
-            'description': 'User is already in contacts'
-        }), 400
-
-    conn.execute('''
-        INSERT INTO contacts (user_id, contact_user_id, first_name, last_name, phone)
-        VALUES (?, ?, ?, ?, ?)
-    ''', (user['id'], contact_user_id, contact_user['first_name'],
-          contact_user['last_name'], contact_user['phone']))
-
-    conn.commit()
-    conn.close()
-
-    return jsonify({
-        'ok': True,
-        'result': 'Contact added successfully'
-    })
-
-@token_required
-def get_updates(user: sqlite3.Row) -> JSONResponse:
-    """Get updates (new messages, etc.) for the user."""
-    offset = int(request.args.get('offset', 0))
-    limit = min(int(request.args.get('limit', 100)), 100)
-
-    conn = get_db_connection()
-
-    unread_messages = conn.execute('''
-        SELECT m.*, u.username, u.first_name, u.last_name, c.title as chat_title
-        FROM messages m
-        JOIN users u ON m.from_user_id = u.id
-        JOIN chats c ON m.chat_id = c.id
-        WHERE m.chat_id IN (
-            SELECT chat_id FROM chat_members
-            WHERE user_id = ? AND status NOT IN ('left', 'kicked')
-        )
-        AND m.id NOT IN (
-            SELECT message_id FROM message_read_status
-            WHERE user_id = ?
-        )
-        AND m.from_user_id != ?
-        ORDER BY m.date DESC
-        LIMIT ? OFFSET ?
-    ''', (user['id'], user['id'], user['id'], limit, offset)).fetchall()
-
-    result = [format_message(msg) for msg in unread_messages]
-
-    for message in unread_messages:
-        conn.execute('''
-            INSERT OR IGNORE INTO message_read_status (message_id, user_id)
-            VALUES (?, ?)
-        ''', (message['id'], user['id']))
-
-    conn.commit()
-    conn.close()
-
-    return jsonify({'ok': True, 'result': result})
-
-@token_required
-@validate_json({'chat_id': int, 'action': str})
-def send_chat_action(user: sqlite3.Row) -> JSONResponse:
-    """Send a chat action (typing, uploading photo, etc.)."""
-    chat_id = request.json['chat_id']
-    action = request.json['action']
-
-    valid_actions = ['typing', 'upload_photo', 'record_video', 'upload_video',
-                    'record_voice', 'upload_voice', 'upload_document', 'find_location']
-
-    if action not in valid_actions:
-        return jsonify({
-            'ok': False,
-            'error_code': 400,
-            'description': 'Invalid action'
-        }), 400
-
-    conn = get_db_connection()
-
-    membership = conn.execute(
-        'SELECT * FROM chat_members WHERE chat_id = ? AND user_id = ? AND status NOT IN ("left", "kicked")',
+    user_status = conn.execute(
+        'SELECT status FROM chat_members WHERE chat_id = ? AND user_id = ?',
         (chat_id, user['id'])
     ).fetchone()
 
-    if not membership:
+    if not user_status or user_status['status'] != 'creator':
         conn.close()
         return jsonify({
             'ok': False,
             'error_code': 403,
-            'description': 'Not a member of this chat'
-        }), 403
-
-    conn.close()
-    return jsonify({
-        'ok': True,
-        'result': 'Action sent successfully'
-    })
-
-@token_required
-@validate_json({'chat_id': int, 'user_id': int})
-def ban_chat_member(user: sqlite3.Row) -> JSONResponse:
-    """Ban a user from a chat."""
-    chat_id = request.json['chat_id']
-    user_id_to_ban = request.json['user_id']
-
-    if user['id'] == user_id_to_ban:
-        return jsonify({
-            'ok': False,
-            'error_code': 400,
-            'description': 'Cannot ban yourself'
-        }), 400
-
-    conn = get_db_connection()
-
-    user_permissions = conn.execute('''
-        SELECT status, can_restrict_members FROM chat_members
-        WHERE chat_id = ? AND user_id = ? AND status IN ('creator', 'administrator')
-    ''', (chat_id, user['id'])).fetchone()
-
-    if not user_permissions or not user_permissions['can_restrict_members']:
-        conn.close()
-        return jsonify({
-            'ok': False,
-            'error_code': 403,
-            'description': 'Not authorized to ban members'
+            'description': 'Only chat creator can set custom titles'
         }), 403
 
     target_member = conn.execute(
-        'SELECT * FROM chat_members WHERE chat_id = ? AND user_id = ?',
-        (chat_id, user_id_to_ban)
+        'SELECT status FROM chat_members WHERE chat_id = ? AND user_id = ?',
+        (chat_id, user_id)
     ).fetchone()
 
     if not target_member:
@@ -1471,1843 +4695,121 @@ def ban_chat_member(user: sqlite3.Row) -> JSONResponse:
             'description': 'User is not a member of this chat'
         }), 404
 
-    conn.execute('''
-        UPDATE chat_members
-        SET status = 'kicked'
-        WHERE chat_id = ? AND user_id = ?
-    ''', (chat_id, user_id_to_ban))
-
-    conn.commit()
-    conn.close()
-
-    return jsonify({
-        'ok': True,
-        'result': 'User banned successfully'
-    })
-
-@token_required
-@validate_json({'chat_id': int, 'user_id': int})
-def unban_chat_member(user: sqlite3.Row) -> JSONResponse:
-    """Unban a user from a chat."""
-    chat_id = request.json['chat_id']
-    user_id_to_unban = request.json['user_id']
-
-    conn = get_db_connection()
-
-    user_permissions = conn.execute('''
-        SELECT status, can_restrict_members FROM chat_members
-        WHERE chat_id = ? AND user_id = ? AND status IN ('creator', 'administrator')
-    ''', (chat_id, user['id'])).fetchone()
-
-    if not user_permissions or not user_permissions['can_restrict_members']:
+    if target_member['status'] not in ['creator', 'administrator']:
         conn.close()
-        return jsonify({
-            'ok': False,
-            'error_code': 403,
-            'description': 'Not authorized to unban members'
-        }), 403
-
-    target_member = conn.execute(
-        'SELECT * FROM chat_members WHERE chat_id = ? AND user_id = ? AND status = "kicked"',
-        (chat_id, user_id_to_unban)
-    ).fetchone()
-
-    if not target_member:
-        conn.close()
-        return jsonify({
-            'ok': False,
-            'error_code': 404,
-            'description': 'User is not banned from this chat'
-        }), 404
-
-    conn.execute(
-        'DELETE FROM chat_members WHERE chat_id = ? AND user_id = ?',
-        (chat_id, user_id_to_unban)
-    )
-
-    conn.commit()
-    conn.close()
-
-    return jsonify({
-        'ok': True,
-        'result': 'User unbanned successfully'
-    })
-
-@app.route('/api/file/upload', methods=['POST'])
-@rate_limit
-@token_required
-def upload_file(user: sqlite3.Row) -> JSONResponse:
-    """Upload a file."""
-    if 'file' not in request.files:
         return jsonify({
             'ok': False,
             'error_code': 400,
-            'description': 'No file provided'
+            'description': 'Can only set custom title for administrators'
         }), 400
 
-    file = request.files['file']
-
-    if file.filename == '':
-        return jsonify({
-            'ok': False,
-            'error_code': 400,
-            'description': 'No file selected'
-        }), 400
-
-    file.seek(0, os.SEEK_END)
-    file_size = file.tell()
-    file.seek(0)
-
-    if file_size > app.config['MAX_FILE_SIZE']:
-        return jsonify({
-            'ok': False,
-            'error_code': 400,
-            'description': f'File too large. Max size is {app.config["MAX_FILE_SIZE"]} bytes'
-        }), 400
-
-    file_id = str(uuid.uuid4())
-    file_extension = os.path.splitext(file.filename)[1]
-    filename = f"{file_id}{file_extension}"
-    file_path = os.path.join(app.config['UPLOAD_FOLDER'], filename)
-
-    file.save(file_path)
-
-    conn = get_db_connection()
-    conn.execute('''
-        INSERT INTO files (id, original_name, mime_type, size, uploaded_by, uploaded_at)
-        VALUES (?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
-    ''', (file_id, file.filename, file.mimetype, file_size, user['id']))
-
-    conn.commit()
-    conn.close()
-
-    return jsonify({
-        'ok': True,
-        'result': {
-            'file_id': file_id,
-            'file_size': file_size,
-            'file_path': file_path
-        }
-    })
-
-@app.route('/api/file/download/<file_id>')
-@rate_limit
-@token_required
-def download_file(user: sqlite3.Row, file_id: str) -> Any:
-    """Download a file."""
-    conn = get_db_connection()
-
-    file_info = conn.execute(
-        'SELECT * FROM files WHERE id = ?',
-        (file_id,)
-    ).fetchone()
-
-    if not file_info:
-        conn.close()
-        return jsonify({
-            'ok': False,
-            'error_code': 404,
-            'description': 'File not found'
-        }), 404
-
-    file_extension = os.path.splitext(file_info['original_name'])[1]
-    filename = f"{file_id}{file_extension}"
-    file_path = os.path.join(app.config['UPLOAD_FOLDER'], filename)
-
-    if not os.path.exists(file_path):
-        conn.close()
-        return jsonify({
-            'ok': False,
-            'error_code': 404,
-            'description': 'File not found on server'
-        }), 404
-
-    conn.close()
-    return send_file(file_path, as_attachment=True, download_name=file_info['original_name'])
-
-def format_message(message: sqlite3.Row) -> Dict[str, Any]:
-    """Format a message for API response."""
-    return {
-        'message_id': message['message_id'],
-        'from': {
-            'id': message['from_user_id'],
-            'is_bot': False,
-            'first_name': message['first_name'],
-            'last_name': message['last_name'],
-            'username': message['username']
-        },
-        'chat': {
-            'id': message['chat_id']
-        },
-        'date': message['date'],
-        'edit_date': message['edit_date'],
-        'text': message['text'],
-        'media_type': message['media_type'],
-        'media_caption': message['media_caption'],
-        'reply_to_message_id': message['reply_to_message_id'],
-        'is_pinned': bool(message['is_pinned']),
-        'views': message['views']
-    }
-
-def check_if_blocked(user_id: int, target_user_id: int) -> bool:
-    """Check if a user has blocked another user."""
-    conn = get_db_connection()
-    block = conn.execute(
-        'SELECT id FROM blocked_users WHERE user_id = ? AND blocked_user_id = ?',
-        (user_id, target_user_id)
-    ).fetchone()
-    conn.close()
-    return bool(block)
-
-@token_required
-def send_notification(user: sqlite3.Row) -> JSONResponse:
-    """Send a notification (placeholder)."""
-    return jsonify({
-        'ok': True,
-        'result': 'Notification sent'
-    })
-
-@token_required
-def send_document(user: sqlite3.Row) -> JSONResponse:
-    """Send a document (placeholder)."""
-    return jsonify({
-        'ok': True,
-        'result': 'Document sent'
-    })
-
-@token_required
-def fetch_messages(user: sqlite3.Row) -> JSONResponse:
-    """Fetch messages (alias for getMessages)."""
-    return get_messages(user)
-
-@token_required
-def close(user: sqlite3.Row) -> JSONResponse:
-    """Close connection (placeholder)."""
-    return jsonify({
-        'ok': True,
-        'result': 'Connection closed'
-    })
-
-@token_required
-def connect(user: sqlite3.Row) -> JSONResponse:
-    """Connect (placeholder)."""
-    return jsonify({
-        'ok': True,
-        'result': 'Connected'
-    })
-
-@token_required
-def disconnect(user: sqlite3.Row) -> JSONResponse:
-    """Disconnect (placeholder)."""
-    return jsonify({
-        'ok': True,
-        'result': 'Disconnected'
-    })
-
-@token_required
-def refresh(user: sqlite3.Row) -> JSONResponse:
-    """Refresh (placeholder)."""
-    return jsonify({
-        'ok': True,
-        'result': 'Refreshed'
-    })
-
-@token_required
-def update(user: sqlite3.Row) -> JSONResponse:
-    """Update (placeholder)."""
-    return jsonify({
-        'ok': True,
-        'result': 'Updated'
-    })
-
-@token_required
-def upgrade(user: sqlite3.Row) -> JSONResponse:
-    """Upgrade (placeholder)."""
-    return jsonify({
-        'ok': True,
-        'result': 'Upgraded'
-    })
-
-@token_required
-def get_user_profile_photos(user: sqlite3.Row) -> JSONResponse:
-    """Get user profile photos (placeholder)."""
-    return jsonify({
-        'ok': True,
-        'result': {
-            'total_count': 0,
-            'photos': []
-        }
-    })
-
-@token_required
-@validate_json({'chat_id': int, 'permissions': dict})
-def set_chat_permissions(user: sqlite3.Row) -> JSONResponse:
-    """Set chat permissions (placeholder)."""
-    return jsonify({
-        'ok': True,
-        'result': 'Permissions updated'
-    })
-
-@token_required
-def get_chat_members_count(user: sqlite3.Row) -> JSONResponse:
-    """Get chat members count."""
-    chat_id = request.args.get('chat_id')
-    if not chat_id:
-        return jsonify({
-            'ok': False,
-            'error_code': 400,
-            'description': 'chat_id parameter is required'
-        }), 400
-
-    conn = get_db_connection()
-
-    count = conn.execute(
-        'SELECT COUNT(*) FROM chat_members WHERE chat_id = ? AND status NOT IN ("left", "kicked")',
-        (chat_id,)
-    ).fetchone()[0]
-
-    conn.close()
-
-    return jsonify({
-        'ok': True,
-        'result': count
-    })
-
-@token_required
-def get_chat_member(user: sqlite3.Row) -> JSONResponse:
-    """Get information about a chat member."""
-    chat_id = request.args.get('chat_id')
-    user_id = request.args.get('user_id')
-
-    if not chat_id or not user_id:
-        return jsonify({
-            'ok': False,
-            'error_code': 400,
-            'description': 'chat_id and user_id parameters are required'
-        }), 400
-
-    conn = get_db_connection()
-
-    member = conn.execute('''
-        SELECT cm.*, u.username, u.first_name, u.last_name
-        FROM chat_members cm
-        JOIN users u ON cm.user_id = u.id
-        WHERE cm.chat_id = ? AND cm.user_id = ?
-    ''', (chat_id, user_id)).fetchone()
-
-    if not member:
-        conn.close()
-        return jsonify({
-            'ok': False,
-            'error_code': 404,
-            'description': 'Chat member not found'
-        }), 404
-
-    conn.close()
-
-    return jsonify({
-        'ok': True,
-        'result': {
-            'user': {
-                'id': member['user_id'],
-                'username': member['username'],
-                'first_name': member['first_name'],
-                'last_name': member['last_name']
-            },
-            'status': member['status'],
-            'until_date': member['until_date'],
-            'joined_date': member['joined_date'],
-            'can_send_messages': bool(member['can_send_messages']),
-            'can_send_media_messages': bool(member['can_send_media_messages']),
-            'can_send_polls': bool(member['can_send_polls']),
-            'can_send_other_messages': bool(member['can_send_other_messages']),
-            'can_add_web_page_previews': bool(member['can_add_web_page_previews']),
-            'can_change_info': bool(member['can_change_info']),
-            'can_invite_users': bool(member['can_invite_users']),
-            'can_pin_messages': bool(member['can_pin_messages'])
-        }
-    })
-
-@token_required
-@validate_json({'chat_id': int, 'photo': str})
-def set_chat_photo(user: sqlite3.Row) -> JSONResponse:
-    """Set chat photo."""
-    chat_id = request.json['chat_id']
-    photo_file_id = request.json['photo']
-
-    conn = get_db_connection()
-
-    user_permissions = conn.execute('''
-        SELECT status, can_change_info FROM chat_members
-        WHERE chat_id = ? AND user_id = ? AND status IN ('creator', 'administrator')
-    ''', (chat_id, user['id'])).fetchone()
-
-    if not user_permissions or not user_permissions['can_change_info']:
-        conn.close()
-        return jsonify({
-            'ok': False,
-            'error_code': 403,
-            'description': 'Not authorized to change chat photo'
-        }), 403
-
-    conn.execute(
-        'UPDATE chats SET photo_file_id = ? WHERE id = ?',
-        (photo_file_id, chat_id)
-    )
-
-    conn.commit()
-    conn.close()
-
-    return jsonify({
-        'ok': True,
-        'result': 'Chat photo updated successfully'
-    })
-
-@token_required
-@validate_json({'chat_id': int})
-def delete_chat_photo(user: sqlite3.Row) -> JSONResponse:
-    """Delete chat photo."""
-    chat_id = request.json['chat_id']
-
-    conn = get_db_connection()
-
-    user_permissions = conn.execute('''
-        SELECT status, can_change_info FROM chat_members
-        WHERE chat_id = ? AND user_id = ? AND status IN ('creator', 'administrator')
-    ''', (chat_id, user['id'])).fetchone()
-
-    if not user_permissions or not user_permissions['can_change_info']:
-        conn.close()
-        return jsonify({
-            'ok': False,
-            'error_code': 403,
-            'description': 'Not authorized to delete chat photo'
-        }), 403
-
-    conn.execute(
-        'UPDATE chats SET photo_file_id = NULL WHERE id = ?',
-        (chat_id,)
-    )
-
-    conn.commit()
-    conn.close()
-
-    return jsonify({
-        'ok': True,
-        'result': 'Chat photo deleted successfully'
-    })
-
-@token_required
-@validate_json({'chat_id': int, 'title': str})
-def set_chat_title(user: sqlite3.Row) -> JSONResponse:
-    """Set chat title."""
-    chat_id = request.json['chat_id']
-    title = request.json['title']
-
-    if len(title) > 255:
-        return jsonify({
-            'ok': False,
-            'error_code': 400,
-            'description': 'Title is too long (max 255 characters)'
-        }), 400
-
-    conn = get_db_connection()
-
-    user_permissions = conn.execute('''
-        SELECT status, can_change_info FROM chat_members
-        WHERE chat_id = ? AND user_id = ? AND status IN ('creator', 'administrator')
-    ''', (chat_id, user['id'])).fetchone()
-
-    if not user_permissions or not user_permissions['can_change_info']:
-        conn.close()
-        return jsonify({
-            'ok': False,
-            'error_code': 403,
-            'description': 'Not authorized to change chat title'
-        }), 403
-
-    conn.execute(
-        'UPDATE chats SET title = ? WHERE id = ?',
-        (title, chat_id)
-    )
-
-    conn.commit()
-    conn.close()
-
-    return jsonify({
-        'ok': True,
-        'result': 'Chat title updated successfully'
-    })
-
-@token_required
-@validate_json({'chat_id': int, 'description': str})
-def set_chat_description(user: sqlite3.Row) -> JSONResponse:
-    """Set chat description."""
-    chat_id = request.json['chat_id']
-    description = request.json['description']
-
-    if len(description) > 255:
-        return jsonify({
-            'ok': False,
-            'error_code': 400,
-            'description': 'Description is too long (max 255 characters)'
-        }), 400
-
-    conn = get_db_connection()
-
-    user_permissions = conn.execute('''
-        SELECT status, can_change_info FROM chat_members
-        WHERE chat_id = ? AND user_id = ? AND status IN ('creator', 'administrator')
-    ''', (chat_id, user['id'])).fetchone()
-
-    if not user_permissions or not user_permissions['can_change_info']:
-        conn.close()
-        return jsonify({
-            'ok': False,
-            'error_code': 403,
-            'description': 'Not authorized to change chat description'
-        }), 403
-
-    conn.execute(
-        'UPDATE chats SET description = ? WHERE id = ?',
-        (description, chat_id)
-    )
-
-    conn.commit()
-    conn.close()
-
-    return jsonify({
-        'ok': True,
-        'result': 'Chat description updated successfully'
-    })
-
-@token_required
-@validate_json({'chat_id': int, 'message_id': int})
-def pin_chat_message(user: sqlite3.Row) -> JSONResponse:
-    """Pin a message in chat."""
-    chat_id = request.json['chat_id']
-    message_id = request.json['message_id']
-
-    conn = get_db_connection()
-
-    user_permissions = conn.execute('''
-        SELECT status, can_pin_messages FROM chat_members
-        WHERE chat_id = ? AND user_id = ? AND status IN ('creator', 'administrator')
-    ''', (chat_id, user['id'])).fetchone()
-
-    if not user_permissions or not user_permissions['can_pin_messages']:
-        conn.close()
-        return jsonify({
-            'ok': False,
-            'error_code': 403,
-            'description': 'Not authorized to pin messages'
-        }), 403
-
-    message = conn.execute(
-        'SELECT * FROM messages WHERE chat_id = ? AND message_id = ?',
-        (chat_id, message_id)
-    ).fetchone()
-
-    if not message:
-        conn.close()
-        return jsonify({
-            'ok': False,
-            'error_code': 404,
-            'description': 'Message not found'
-        }), 404
-
-    conn.execute(
-        'UPDATE messages SET is_pinned = FALSE WHERE chat_id = ? AND is_pinned = TRUE',
-        (chat_id,)
-    )
-
-    conn.execute(
-        'UPDATE messages SET is_pinned = TRUE WHERE chat_id = ? AND message_id = ?',
-        (chat_id, message_id)
-    )
-
-    conn.commit()
-    conn.close()
-
-    return jsonify({
-        'ok': True,
-        'result': 'Message pinned successfully'
-    })
-
-@token_required
-@validate_json({'chat_id': int, 'message_id': int})
-def unpin_chat_message(user: sqlite3.Row) -> JSONResponse:
-    """Unpin a message in chat."""
-    chat_id = request.json['chat_id']
-    message_id = request.json['message_id']
-
-    conn = get_db_connection()
-
-    user_permissions = conn.execute('''
-        SELECT status, can_pin_messages FROM chat_members
-        WHERE chat_id = ? AND user_id = ? AND status IN ('creator', 'administrator')
-    ''', (chat_id, user['id'])).fetchone()
-
-    if not user_permissions or not user_permissions['can_pin_messages']:
-        conn.close()
-        return jsonify({
-            'ok': False,
-            'error_code': 403,
-            'description': 'Not authorized to unpin messages'
-        }), 403
-
-    result = conn.execute(
-        'UPDATE messages SET is_pinned = FALSE WHERE chat_id = ? AND message_id = ?',
-        (chat_id, message_id)
-    )
-
-    conn.commit()
-    conn.close()
-
-    if result.rowcount == 0:
-        return jsonify({
-            'ok': False,
-            'error_code': 404,
-            'description': 'Message not found or not pinned'
-        }), 404
-
-    return jsonify({
-        'ok': True,
-        'result': 'Message unpinned successfully'
-    })
-
-@token_required
-@validate_json({'chat_id': int})
-def unpin_all_chat_messages(user: sqlite3.Row) -> JSONResponse:
-    """Unpin all messages in chat."""
-    chat_id = request.json['chat_id']
-
-    conn = get_db_connection()
-
-    user_permissions = conn.execute('''
-        SELECT status, can_pin_messages FROM chat_members
-        WHERE chat_id = ? AND user_id = ? AND status IN ('creator', 'administrator')
-    ''', (chat_id, user['id'])).fetchone()
-
-    if not user_permissions or not user_permissions['can_pin_messages']:
-        conn.close()
-        return jsonify({
-            'ok': False,
-            'error_code': 403,
-            'description': 'Not authorized to unpin messages'
-        }), 403
-
-    conn.execute(
-        'UPDATE messages SET is_pinned = FALSE WHERE chat_id = ?',
-        (chat_id,)
-    )
-
-    conn.commit()
-    conn.close()
-
-    return jsonify({
-        'ok': True,
-        'result': 'All messages unpinned successfully'
-    })
-
-@token_required
-@validate_json({'callback_query_id': str, 'text': str})
-def answer_callback_query(user: sqlite3.Row) -> JSONResponse:
-    """Answer a callback query."""
-    callback_query_id = request.json['callback_query_id']
-    text = request.json.get('text', '')
-
-    return jsonify({
-        'ok': True,
-        'result': 'Callback query answered successfully'
-    })
-
-@token_required
-@validate_json({'chat_id': int, 'message_id': int, 'reaction': str})
-def set_message_reaction(user: sqlite3.Row) -> JSONResponse:
-    """Set reaction to a message."""
-    chat_id = request.json['chat_id']
-    message_id = request.json['message_id']
-    reaction = request.json['reaction']
-
-    if len(reaction) > 10:
-        return jsonify({
-            'ok': False,
-            'error_code': 400,
-            'description': 'Reaction is too long'
-        }), 400
-
-    conn = get_db_connection()
-
-    membership = conn.execute(
-        'SELECT * FROM chat_members WHERE chat_id = ? AND user_id = ? AND status NOT IN ("left", "kicked")',
-        (chat_id, user['id'])
-    ).fetchone()
-
-    if not membership:
-        conn.close()
-        return jsonify({
-            'ok': False,
-            'error_code': 403,
-            'description': 'Not a member of this chat'
-        }), 403
-
-    message = conn.execute(
-        'SELECT * FROM messages WHERE chat_id = ? AND message_id = ?',
-        (chat_id, message_id)
-    ).fetchone()
-
-    if not message:
-        conn.close()
-        return jsonify({
-            'ok': False,
-            'error_code': 404,
-            'description': 'Message not found'
-        }), 404
-
-    existing_reaction = conn.execute(
-        'SELECT * FROM reactions WHERE message_id = ? AND user_id = ?',
-        (message['id'], user['id'])
-    ).fetchone()
-
-    if existing_reaction:
+    try:
         conn.execute(
-            'UPDATE reactions SET emoji = ? WHERE message_id = ? AND user_id = ?',
-            (reaction, message['id'], user['id'])
+            'UPDATE chat_members SET custom_title = ? WHERE chat_id = ? AND user_id = ?',
+            (custom_title, chat_id, user_id)
         )
-    else:
-        conn.execute(
-            'INSERT INTO reactions (message_id, user_id, emoji) VALUES (?, ?, ?)',
-            (message['id'], user['id'], reaction)
-        )
-
-    conn.commit()
-    conn.close()
-
-    return jsonify({
-        'ok': True,
-        'result': 'Reaction set successfully'
-    })
-
-@token_required
-def get_message_reactions(user: sqlite3.Row) -> JSONResponse:
-    """Get reactions for a message."""
-    chat_id = request.args.get('chat_id')
-    message_id = request.args.get('message_id')
-
-    if not chat_id or not message_id:
-        return jsonify({
-            'ok': False,
-            'error_code': 400,
-            'description': 'chat_id and message_id parameters are required'
-        }), 400
-
-    conn = get_db_connection()
-
-    membership = conn.execute(
-        'SELECT * FROM chat_members WHERE chat_id = ? AND user_id = ? AND status NOT IN ("left", "kicked")',
-        (chat_id, user['id'])
-    ).fetchone()
-
-    if not membership:
+        conn.commit()
         conn.close()
+
         return jsonify({
-            'ok': False,
-            'error_code': 403,
-            'description': 'Not a member of this chat'
-        }), 403
-
-    message = conn.execute(
-        'SELECT * FROM messages WHERE chat_id = ? AND message_id = ?',
-        (chat_id, message_id)
-    ).fetchone()
-
-    if not message:
-        conn.close()
-        return jsonify({
-            'ok': False,
-            'error_code': 404,
-            'description': 'Message not found'
-        }), 404
-
-    reactions = conn.execute('''
-        SELECT r.emoji, COUNT(*) as count,
-               GROUP_CONCAT(u.username) as usernames
-        FROM reactions r
-        JOIN users u ON r.user_id = u.id
-        WHERE r.message_id = ?
-        GROUP BY r.emoji
-    ''', (message['id'],)).fetchall()
-
-    result = []
-    for reaction in reactions:
-        result.append({
-            'emoji': reaction['emoji'],
-            'count': reaction['count'],
-            'usernames': reaction['usernames'].split(',') if reaction['usernames'] else []
+            'ok': True,
+            'result': {
+                'success': True,
+                'description': 'Custom title set successfully'
+            }
         })
 
-    conn.close()
-    return jsonify({'ok': True, 'result': result})
-
-@token_required
-@validate_json({'chat_id': int, 'from_chat_id': int, 'message_id': int})
-def forward_message(user: sqlite3.Row) -> JSONResponse:
-    """Forward a message to another chat."""
-    chat_id = request.json['chat_id']
-    from_chat_id = request.json['from_chat_id']
-    message_id = request.json['message_id']
-
-    conn = get_db_connection()
-
-    target_membership = conn.execute(
-        'SELECT * FROM chat_members WHERE chat_id = ? AND user_id = ? AND status NOT IN ("left", "kicked")',
-        (chat_id, user['id'])
-    ).fetchone()
-
-    source_membership = conn.execute(
-        'SELECT * FROM chat_members WHERE chat_id = ? AND user_id = ? AND status NOT IN ("left", "kicked")',
-        (from_chat_id, user['id'])
-    ).fetchone()
-
-    if not target_membership or not source_membership:
+    except sqlite3.Error as e:
         conn.close()
         return jsonify({
             'ok': False,
-            'error_code': 403,
-            'description': 'Not a member of one or both chats'
-        }), 403
+            'error_code': 500,
+            'description': f'Database error: {str(e)}'
+        }), 500
 
-    message = conn.execute(
-        'SELECT * FROM messages WHERE chat_id = ? AND message_id = ?',
-        (from_chat_id, message_id)
-    ).fetchone()
-
-    if not message:
-        conn.close()
-        return jsonify({
-            'ok': False,
-            'error_code': 404,
-            'description': 'Message not found'
-        }), 404
-
-    last_message = conn.execute(
-        'SELECT MAX(message_id) FROM messages WHERE chat_id = ?',
-        (chat_id,)
-    ).fetchone()
-
-    new_message_id = last_message[0] + 1 if last_message[0] else 1
-
-    conn.execute('''
-        INSERT INTO messages (chat_id, from_user_id, text, message_id, media_type,
-                             media_caption, file_id, file_size, mime_type,
-                             reply_to_message_id, forwarded_from, forwarded_from_chat_id)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-    ''', (chat_id, user['id'], message['text'], new_message_id, message['media_type'],
-          message['media_caption'], message['file_id'], message['file_size'],
-          message['mime_type'], message['reply_to_message_id'],
-          message['from_user_id'], from_chat_id))
-
-    conn.commit()
-
-    forwarded_message = conn.execute('''
-        SELECT m.*, u.username, u.first_name, u.last_name
-        FROM messages m
-        JOIN users u ON m.from_user_id = u.id
-        WHERE m.chat_id = ? AND m.message_id = ?
-    ''', (chat_id, new_message_id)).fetchone()
-
-    conn.close()
-
-    return jsonify({
-        'ok': True,
-        'result': format_message(forwarded_message)
-    })
-
-@token_required
-@validate_json({'chat_id': int, 'from_chat_id': int, 'message_id': int})
-def copy_message(user: sqlite3.Row) -> JSONResponse:
-    """Copy a message to another chat."""
-    chat_id = request.json['chat_id']
-    from_chat_id = request.json['from_chat_id']
-    message_id = request.json['message_id']
-
-    conn = get_db_connection()
-
-    target_membership = conn.execute(
-        'SELECT * FROM chat_members WHERE chat_id = ? AND user_id = ? AND status NOT IN ("left", "kicked")',
-        (chat_id, user['id'])
-    ).fetchone()
-
-    source_membership = conn.execute(
-        'SELECT * FROM chat_members WHERE chat_id = ? AND user_id = ? AND status NOT IN ("left", "kicked")',
-        (from_chat_id, user['id'])
-    ).fetchone()
-
-    if not target_membership or not source_membership:
-        conn.close()
-        return jsonify({
-            'ok': False,
-            'error_code': 403,
-            'description': 'Not a member of one or both chats'
-        }), 403
-
-    message = conn.execute(
-        'SELECT * FROM messages WHERE chat_id = ? AND message_id = ?',
-        (from_chat_id, message_id)
-    ).fetchone()
-
-    if not message:
-        conn.close()
-        return jsonify({
-            'ok': False,
-            'error_code': 404,
-            'description': 'Message not found'
-        }), 404
-
-    last_message = conn.execute(
-        'SELECT MAX(message_id) FROM messages WHERE chat_id = ?',
-        (chat_id,)
-    ).fetchone()
-
-    new_message_id = last_message[0] + 1 if last_message[0] else 1
-
-    conn.execute('''
-        INSERT INTO messages (chat_id, from_user_id, text, message_id, media_type,
-                             media_caption, file_id, file_size, mime_type,
-                             reply_to_message_id)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-    ''', (chat_id, user['id'], message['text'], new_message_id, message['media_type'],
-          message['media_caption'], message['file_id'], message['file_size'],
-          message['mime_type'], message['reply_to_message_id']))
-
-    conn.commit()
-
-    copied_message = conn.execute('''
-        SELECT m.*, u.username, u.first_name, u.last_name
-        FROM messages m
-        JOIN users u ON m.from_user_id = u.id
-        WHERE m.chat_id = ? AND m.message_id = ?
-    ''', (chat_id, new_message_id)).fetchone()
-
-    conn.close()
-
-    return jsonify({
-        'ok': True,
-        'result': format_message(copied_message)
-    })
-
-@token_required
-@validate_json({'chat_id': int, 'photo': str})
-def send_photo(user: sqlite3.Row) -> JSONResponse:
-    """Send a photo to a chat."""
-    chat_id = request.json['chat_id']
-    photo_file_id = request.json['photo']
-    caption = request.json.get('caption', '')
-
-    if len(caption) > 1024:
-        return jsonify({
-            'ok': False,
-            'error_code': 400,
-            'description': 'Caption is too long (max 1024 characters)'
-        }), 400
-
-    conn = get_db_connection()
-
-    membership = conn.execute('''
-        SELECT * FROM chat_members
-        WHERE chat_id = ? AND user_id = ?
-        AND status NOT IN ('kicked', 'left')
-        AND can_send_media_messages = TRUE
-    ''', (chat_id, user['id'])).fetchone()
-
-    if not membership:
-        conn.close()
-        return jsonify({
-            'ok': False,
-            'error_code': 403,
-            'description': 'Not allowed to send media in this chat'
-        }), 403
-
-    last_message = conn.execute(
-        'SELECT MAX(message_id) FROM messages WHERE chat_id = ?',
-        (chat_id,)
-    ).fetchone()
-
-    new_message_id = last_message[0] + 1 if last_message[0] else 1
-
-    conn.execute('''
-        INSERT INTO messages (chat_id, from_user_id, message_id, media_type, media_caption, file_id)
-        VALUES (?, ?, ?, 'photo', ?, ?)
-    ''', (chat_id, user['id'], new_message_id, caption, photo_file_id))
-
-    conn.commit()
-
-    sent_message = conn.execute('''
-        SELECT m.*, u.username, u.first_name, u.last_name
-        FROM messages m
-        JOIN users u ON m.from_user_id = u.id
-        WHERE m.chat_id = ? AND m.message_id = ?
-    ''', (chat_id, new_message_id)).fetchone()
-
-    conn.close()
-
-    return jsonify({
-        'ok': True,
-        'result': format_message(sent_message)
-    })
-
-@token_required
-@validate_json({'chat_id': int, 'audio': str})
-def send_audio(user: sqlite3.Row) -> JSONResponse:
-    """Send an audio file to a chat."""
-    chat_id = request.json['chat_id']
-    audio_file_id = request.json['audio']
-    caption = request.json.get('caption', '')
-    duration = request.json.get('duration', 0)
-
-    if len(caption) > 1024:
-        return jsonify({
-            'ok': False,
-            'error_code': 400,
-            'description': 'Caption is too long (max 1024 characters)'
-        }), 400
-
-    conn = get_db_connection()
-
-    membership = conn.execute('''
-        SELECT * FROM chat_members
-        WHERE chat_id = ? AND user_id = ?
-        AND status NOT IN ('kicked', 'left')
-        AND can_send_media_messages = TRUE
-    ''', (chat_id, user['id'])).fetchone()
-
-    if not membership:
-        conn.close()
-        return jsonify({
-            'ok': False,
-            'error_code': 403,
-            'description': 'Not allowed to send media in this chat'
-        }), 403
-
-    last_message = conn.execute(
-        'SELECT MAX(message_id) FROM messages WHERE chat_id = ?',
-        (chat_id,)
-    ).fetchone()
-
-    new_message_id = last_message[0] + 1 if last_message[0] else 1
-
-    conn.execute('''
-        INSERT INTO messages (chat_id, from_user_id, message_id, media_type, media_caption, file_id, file_size)
-        VALUES (?, ?, ?, 'audio', ?, ?, ?)
-    ''', (chat_id, user['id'], new_message_id, caption, audio_file_id, duration))
-
-    conn.commit()
-
-    sent_message = conn.execute('''
-        SELECT m.*, u.username, u.first_name, u.last_name
-        FROM messages m
-        JOIN users u ON m.from_user_id = u.id
-        WHERE m.chat_id = ? AND m.message_id = ?
-    ''', (chat_id, new_message_id)).fetchone()
-
-    conn.close()
-
-    return jsonify({
-        'ok': True,
-        'result': format_message(sent_message)
-    })
-
-@token_required
-@validate_json({'chat_id': int, 'video': str})
-def send_video(user: sqlite3.Row) -> JSONResponse:
-    """Send a video to a chat."""
-    chat_id = request.json['chat_id']
-    video_file_id = request.json['video']
-    caption = request.json.get('caption', '')
-    duration = request.json.get('duration', 0)
-
-    if len(caption) > 1024:
-        return jsonify({
-            'ok': False,
-            'error_code': 400,
-            'description': 'Caption is too long (max 1024 characters)'
-        }), 400
-
-    conn = get_db_connection()
-
-    membership = conn.execute('''
-        SELECT * FROM chat_members
-        WHERE chat_id = ? AND user_id = ?
-        AND status NOT IN ('kicked', 'left')
-        AND can_send_media_messages = TRUE
-    ''', (chat_id, user['id'])).fetchone()
-
-    if not membership:
-        conn.close()
-        return jsonify({
-            'ok': False,
-            'error_code': 403,
-            'description': 'Not allowed to send media in this chat'
-        }), 403
-
-    last_message = conn.execute(
-        'SELECT MAX(message_id) FROM messages WHERE chat_id = ?',
-        (chat_id,)
-    ).fetchone()
-
-    new_message_id = last_message[0] + 1 if last_message[0] else 1
-
-    conn.execute('''
-        INSERT INTO messages (chat_id, from_user_id, message_id, media_type, media_caption, file_id, file_size)
-        VALUES (?, ?, ?, 'video', ?, ?, ?)
-    ''', (chat_id, user['id'], new_message_id, caption, video_file_id, duration))
-
-    conn.commit()
-
-    sent_message = conn.execute('''
-        SELECT m.*, u.username, u.first_name, u.last_name
-        FROM messages m
-        JOIN users u ON m.from_user_id = u.id
-        WHERE m.chat_id = ? AND m.message_id = ?
-    ''', (chat_id, new_message_id)).fetchone()
-
-    conn.close()
-
-    return jsonify({
-        'ok': True,
-        'result': format_message(sent_message)
-    })
-
-@token_required
-@validate_json({'chat_id': int, 'voice': str})
-def send_voice(user: sqlite3.Row) -> JSONResponse:
-    """Send a voice message to a chat."""
-    chat_id = request.json['chat_id']
-    voice_file_id = request.json['voice']
-    caption = request.json.get('caption', '')
-    duration = request.json.get('duration', 0)
-
-    if len(caption) > 1024:
-        return jsonify({
-            'ok': False,
-            'error_code': 400,
-            'description': 'Caption is too long (max 1024 characters)'
-        }), 400
-
-    conn = get_db_connection()
-
-    membership = conn.execute('''
-        SELECT * FROM chat_members
-        WHERE chat_id = ? AND user_id = ?
-        AND status NOT IN ('kicked', 'left')
-        AND can_send_media_messages = TRUE
-    ''', (chat_id, user['id'])).fetchone()
-
-    if not membership:
-        conn.close()
-        return jsonify({
-            'ok': False,
-            'error_code': 403,
-            'description': 'Not allowed to send media in this chat'
-        }), 403
-
-    last_message = conn.execute(
-        'SELECT MAX(message_id) FROM messages WHERE chat_id = ?',
-        (chat_id,)
-    ).fetchone()
-
-    new_message_id = last_message[0] + 1 if last_message[0] else 1
-
-    conn.execute('''
-        INSERT INTO messages (chat_id, from_user_id, message_id, media_type, media_caption, file_id, file_size)
-        VALUES (?, ?, ?, 'voice', ?, ?, ?)
-    ''', (chat_id, user['id'], new_message_id, caption, voice_file_id, duration))
-
-    conn.commit()
-
-    sent_message = conn.execute('''
-        SELECT m.*, u.username, u.first_name, u.last_name
-        FROM messages m
-        JOIN users u ON m.from_user_id = u.id
-        WHERE m.chat_id = ? AND m.message_id = ?
-    ''', (chat_id, new_message_id)).fetchone()
-
-    conn.close()
-
-    return jsonify({
-        'ok': True,
-        'result': format_message(sent_message)
-    })
-
-@token_required
-@validate_json({'chat_id': int, 'latitude': float, 'longitude': float})
-def send_location(user: sqlite3.Row) -> JSONResponse:
-    """Send a location to a chat."""
-    chat_id = request.json['chat_id']
-    latitude = request.json['latitude']
-    longitude = request.json['longitude']
-
-    if not (-90 <= latitude <= 90) or not (-180 <= longitude <= 180):
-        return jsonify({
-            'ok': False,
-            'error_code': 400,
-            'description': 'Invalid coordinates'
-        }), 400
-
-    conn = get_db_connection()
-
-    membership = conn.execute('''
-        SELECT * FROM chat_members
-        WHERE chat_id = ? AND user_id = ?
-        AND status NOT IN ('kicked', 'left')
-    ''', (chat_id, user['id'])).fetchone()
-
-    if not membership:
-        conn.close()
-        return jsonify({
-            'ok': False,
-            'error_code': 403,
-            'description': 'Not allowed to send messages in this chat'
-        }), 403
-
-    last_message = conn.execute(
-        'SELECT MAX(message_id) FROM messages WHERE chat_id = ?',
-        (chat_id,)
-    ).fetchone()
-
-    new_message_id = last_message[0] + 1 if last_message[0] else 1
-
-    location_data = json.dumps({'latitude': latitude, 'longitude': longitude})
-    conn.execute('''
-        INSERT INTO messages (chat_id, from_user_id, message_id, media_type, text)
-        VALUES (?, ?, ?, 'location', ?)
-    ''', (chat_id, user['id'], new_message_id, location_data))
-
-    conn.commit()
-
-    sent_message = conn.execute('''
-        SELECT m.*, u.username, u.first_name, u.last_name
-        FROM messages m
-        JOIN users u ON m.from_user_id = u.id
-        WHERE m.chat_id = ? AND m.message_id = ?
-    ''', (chat_id, new_message_id)).fetchone()
-
-    conn.close()
-
-    return jsonify({
-        'ok': True,
-        'result': format_message(sent_message)
-    })
-
-@token_required
-@validate_json({'chat_id': int, 'phone_number': str, 'first_name': str})
-def send_contact(user: sqlite3.Row) -> JSONResponse:
-    """Send a contact to a chat."""
-    chat_id = request.json['chat_id']
-    phone_number = request.json['phone_number']
-    first_name = request.json['first_name']
-    last_name = request.json.get('last_name', '')
-
-    if not phone_number.replace('+', '').replace(' ', '').isdigit():
-        return jsonify({
-            'ok': False,
-            'error_code': 400,
-            'description': 'Invalid phone number'
-        }), 400
-
-    conn = get_db_connection()
-
-    membership = conn.execute('''
-        SELECT * FROM chat_members
-        WHERE chat_id = ? AND user_id = ?
-        AND status NOT IN ('kicked', 'left')
-    ''', (chat_id, user['id'])).fetchone()
-
-    if not membership:
-        conn.close()
-        return jsonify({
-            'ok': False,
-            'error_code': 403,
-            'description': 'Not allowed to send messages in this chat'
-        }), 403
-
-    last_message = conn.execute(
-        'SELECT MAX(message_id) FROM messages WHERE chat_id = ?',
-        (chat_id,)
-    ).fetchone()
-
-    new_message_id = last_message[0] + 1 if last_message[0] else 1
-
-    contact_data = json.dumps({
-        'phone_number': phone_number,
-        'first_name': first_name,
-        'last_name': last_name
-    })
-    conn.execute('''
-        INSERT INTO messages (chat_id, from_user_id, message_id, media_type, text)
-        VALUES (?, ?, ?, 'contact', ?)
-    ''', (chat_id, user['id'], new_message_id, contact_data))
-
-    conn.commit()
-
-    sent_message = conn.execute('''
-        SELECT m.*, u.username, u.first_name, u.last_name
-        FROM messages m
-        JOIN users u ON m.from_user_id = u.id
-        WHERE m.chat_id = ? AND m.message_id = ?
-    ''', (chat_id, new_message_id)).fetchone()
-
-    conn.close()
-
-    return jsonify({
-        'ok': True,
-        'result': format_message(sent_message)
-    })
-
-@token_required
-@validate_json({'chat_id': int, 'question': str, 'options': list})
-def send_poll(user: sqlite3.Row) -> JSONResponse:
-    """Send a poll to a chat."""
-    chat_id = request.json['chat_id']
-    question = request.json['question']
-    options = request.json['options']
-
-    if len(question) > 300:
-        return jsonify({
-            'ok': False,
-            'error_code': 400,
-            'description': 'Question is too long (max 300 characters)'
-        }), 400
-
-    if len(options) < 2 or len(options) > 10:
-        return jsonify({
-            'ok': False,
-            'error_code': 400,
-            'description': 'Poll must have between 2 and 10 options'
-        }), 400
-
-    for option in options:
-        if len(option) > 100:
-            return jsonify({
-                'ok': False,
-                'error_code': 400,
-                'description': 'Option text is too long (max 100 characters)'
-            }), 400
-
-    conn = get_db_connection()
-
-    membership = conn.execute('''
-        SELECT * FROM chat_members
-        WHERE chat_id = ? AND user_id = ?
-        AND status NOT IN ('kicked', 'left')
-        AND can_send_polls = TRUE
-    ''', (chat_id, user['id'])).fetchone()
-
-    if not membership:
-        conn.close()
-        return jsonify({
-            'ok': False,
-            'error_code': 403,
-            'description': 'Not allowed to send polls in this chat'
-        }), 403
-
-    last_message = conn.execute(
-        'SELECT MAX(message_id) FROM messages WHERE chat_id = ?',
-        (chat_id,)
-    ).fetchone()
-
-    new_message_id = last_message[0] + 1 if last_message[0] else 1
-
-    poll_data = json.dumps({
-        'question': question,
-        'options': options,
-        'votes': {}
-    })
-    conn.execute('''
-        INSERT INTO messages (chat_id, from_user_id, message_id, media_type, text)
-        VALUES (?, ?, ?, 'poll', ?)
-    ''', (chat_id, user['id'], new_message_id, poll_data))
-
-    conn.commit()
-
-    sent_message = conn.execute('''
-        SELECT m.*, u.username, u.first_name, u.last_name
-        FROM messages m
-        JOIN users u ON m.from_user_id = u.id
-        WHERE m.chat_id = ? AND m.message_id = ?
-    ''', (chat_id, new_message_id)).fetchone()
-
-    conn.close()
-
-    return jsonify({
-        'ok': True,
-        'result': format_message(sent_message)
-    })
-
-@token_required
-@validate_json({'chat_id': int, 'emoji': str})
-def send_dice(user: sqlite3.Row) -> JSONResponse:
-    """Send a dice throw to a chat."""
-    chat_id = request.json['chat_id']
-    emoji = request.json.get('emoji', '🎲')
-
-    valid_emojis = ['🎲', '🎯', '🏀', '⚽', '🎳', '🎰']
-    if emoji not in valid_emojis:
-        return jsonify({
-            'ok': False,
-            'error_code': 400,
-            'description': 'Invalid emoji. Must be one of: 🎲, 🎯, 🏀, ⚽, 🎳, 🎰'
-        }), 400
-
-    conn = get_db_connection()
-
-    membership = conn.execute('''
-        SELECT * FROM chat_members
-        WHERE chat_id = ? AND user_id = ?
-        AND status NOT IN ('kicked', 'left')
-    ''', (chat_id, user['id'])).fetchone()
-
-    if not membership:
-        conn.close()
-        return jsonify({
-            'ok': False,
-            'error_code': 403,
-            'description': 'Not allowed to send messages in this chat'
-        }), 403
-
-    last_message = conn.execute(
-        'SELECT MAX(message_id) FROM messages WHERE chat_id = ?',
-        (chat_id,)
-    ).fetchone()
-
-    new_message_id = last_message[0] + 1 if last_message[0] else 1
-
-    import random
-    if emoji == '🎲':
-        value = random.randint(1, 6)
-    elif emoji == '🎯':
-        value = random.randint(1, 6)
-    elif emoji in ['🏀', '⚽']:
-        value = random.randint(1, 5)
-    elif emoji == '🎳':
-        value = random.randint(1, 6)
-    elif emoji == '🎰':
-        value = random.randint(1, 64)
-
-    dice_data = json.dumps({'emoji': emoji, 'value': value})
-    conn.execute('''
-        INSERT INTO messages (chat_id, from_user_id, message_id, media_type, text)
-        VALUES (?, ?, ?, 'dice', ?)
-    ''', (chat_id, user['id'], new_message_id, dice_data))
-
-    conn.commit()
-
-    sent_message = conn.execute('''
-        SELECT m.*, u.username, u.first_name, u.last_name
-        FROM messages m
-        JOIN users u ON m.from_user_id = u.id
-        WHERE m.chat_id = ? AND m.message_id = ?
-    ''', (chat_id, new_message_id)).fetchone()
-
-    conn.close()
-
-    return jsonify({
-        'ok': True,
-        'result': format_message(sent_message)
-    })
-
-@token_required
-def search_messages(user: sqlite3.Row) -> JSONResponse:
-    """Search for messages in all chats."""
-    query = request.args.get('query')
-    if not query:
-        return jsonify({
-            'ok': False,
-            'error_code': 400,
-            'description': 'query parameter is required'
-        }), 400
-
-    limit = min(int(request.args.get('limit', 100)), 1000)
-    offset = int(request.args.get('offset', 0))
-
-    conn = get_db_connection()
-
-    messages = conn.execute('''
-        SELECT m.*, u.username, u.first_name, u.last_name, c.title as chat_title
-        FROM messages m
-        JOIN users u ON m.from_user_id = u.id
-        JOIN chats c ON m.chat_id = c.id
-        WHERE m.chat_id IN (
-            SELECT chat_id FROM chat_members
-            WHERE user_id = ? AND status NOT IN ('left', 'kicked')
-        )
-        AND m.text LIKE ?
-        ORDER BY m.date DESC
-        LIMIT ? OFFSET ?
-    ''', (user['id'], f'%{query}%', limit, offset)).fetchall()
-
-    result = []
-    for msg in messages:
-        message_data = format_message(msg)
-        message_data['chat_title'] = msg['chat_title']
-        result.append(message_data)
-
-    conn.close()
-    return jsonify({'ok': True, 'result': result})
-
-@token_required
-@validate_json({'chat_id': int, 'message_id': int})
-def read_message(user: sqlite3.Row) -> JSONResponse:
-    """Mark a message as read."""
-    chat_id = request.json['chat_id']
-    message_id = request.json['message_id']
-
-    conn = get_db_connection()
-
-    membership = conn.execute(
-        'SELECT * FROM chat_members WHERE chat_id = ? AND user_id = ? AND status NOT IN ("left", "kicked")',
-        (chat_id, user['id'])
-    ).fetchone()
-
-    if not membership:
-        conn.close()
-        return jsonify({
-            'ok': False,
-            'error_code': 403,
-            'description': 'Not a member of this chat'
-        }), 403
-
-    message = conn.execute(
-        'SELECT * FROM messages WHERE chat_id = ? AND message_id = ?',
-        (chat_id, message_id)
-    ).fetchone()
-
-    if not message:
-        conn.close()
-        return jsonify({
-            'ok': False,
-            'error_code': 404,
-            'description': 'Message not found'
-        }), 404
-
-    conn.execute('''
-        INSERT OR REPLACE INTO message_read_status (message_id, user_id)
-        VALUES (?, ?)
-    ''', (message['id'], user['id']))
-
-    conn.commit()
-    conn.close()
-
-    return jsonify({
-        'ok': True,
-        'result': 'Message marked as read'
-    })
-
-@token_required
-def get_unread_count(user: sqlite3.Row) -> JSONResponse:
-    """Get count of unread messages."""
-    conn = get_db_connection()
-
-    unread_count = conn.execute('''
-        SELECT COUNT(*) as count
-        FROM messages m
-        WHERE m.chat_id IN (
-            SELECT chat_id FROM chat_members
-            WHERE user_id = ? AND status NOT IN ('left', 'kicked')
-        )
-        AND m.from_user_id != ?
-        AND m.id NOT IN (
-            SELECT message_id FROM message_read_status
-            WHERE user_id = ?
-        )
-    ''', (user['id'], user['id'], user['id'])).fetchone()['count']
-
-    unread_per_chat = conn.execute('''
-        SELECT m.chat_id, c.title, COUNT(*) as count
-        FROM messages m
-        JOIN chats c ON m.chat_id = c.id
-        WHERE m.chat_id IN (
-            SELECT chat_id FROM chat_members
-            WHERE user_id = ? AND status NOT IN ('left', 'kicked')
-        )
-        AND m.from_user_id != ?
-        AND m.id NOT IN (
-            SELECT message_id FROM message_read_status
-            WHERE user_id = ?
-        )
-        GROUP BY m.chat_id
-    ''', (user['id'], user['id'], user['id'])).fetchall()
-
-    result = {
-        'total': unread_count,
-        'by_chat': [{'chat_id': row['chat_id'], 'title': row['title'], 'count': row['count']}
-                   for row in unread_per_chat]
-    }
-
-    conn.close()
-    return jsonify({'ok': True, 'result': result})
-
-@token_required
-@validate_json({'chat_id': int, 'message_id': int, 'caption': str})
-def edit_message_caption(user: sqlite3.Row) -> JSONResponse:
-    """Edit the caption of a media message."""
-    chat_id = request.json['chat_id']
-    message_id = request.json['message_id']
-    new_caption = request.json['caption']
-
-    if len(new_caption) > 1024:
-        return jsonify({
-            'ok': False,
-            'error_code': 400,
-            'description': 'Caption is too long (max 1024 characters)'
-        }), 400
-
-    conn = get_db_connection()
-
-    message = conn.execute('''
-        SELECT * FROM messages
-        WHERE chat_id = ? AND message_id = ?
-    ''', (chat_id, message_id)).fetchone()
-
-    if not message:
-        conn.close()
-        return jsonify({
-            'ok': False,
-            'error_code': 404,
-            'description': 'Message not found'
-        }), 404
-
-    if not message['media_type'] or message['media_type'] == 'text':
-        conn.close()
-        return jsonify({
-            'ok': False,
-            'error_code': 400,
-            'description': 'Message is not a media message'
-        }), 400
-
-    is_author = message['from_user_id'] == user['id']
-
-    if not is_author:
-        user_permissions = conn.execute('''
-            SELECT status FROM chat_members
-            WHERE chat_id = ? AND user_id = ? AND status IN ('creator', 'administrator')
-        ''', (chat_id, user['id'])).fetchone()
-
-        if not user_permissions:
-            conn.close()
-            return jsonify({
-                'ok': False,
-                'error_code': 403,
-                'description': 'Not authorized to edit this message'
-            }), 403
-
-    conn.execute('''
-        UPDATE messages
-        SET media_caption = ?, edit_date = CURRENT_TIMESTAMP
-        WHERE chat_id = ? AND message_id = ?
-    ''', (new_caption, chat_id, message_id))
-
-    conn.commit()
-
-    updated_message = conn.execute('''
-        SELECT m.*, u.username, u.first_name, u.last_name
-        FROM messages m
-        JOIN users u ON m.from_user_id = u.id
-        WHERE m.chat_id = ? AND m.message_id = ?
-    ''', (chat_id, message_id)).fetchone()
-
-    conn.close()
-
-    return jsonify({
-        'ok': True,
-        'result': {
-            'message_id': updated_message['message_id'],
-            'from': {
-                'id': updated_message['from_user_id'],
-                'is_bot': False,
-                'first_name': updated_message['first_name'],
-                'last_name': updated_message['last_name'],
-                'username': updated_message['username']
-            },
-            'chat': {'id': updated_message['chat_id']},
-            'date': updated_message['date'],
-            'edit_date': updated_message['edit_date'],
-            'media_type': updated_message['media_type'],
-            'media_caption': updated_message['media_caption'],
-            'file_id': updated_message['file_id']
-        }
-    })
-
-@token_required
-@validate_json({'photo': str})
-def set_user_profile_photo(user: sqlite3.Row) -> JSONResponse:
-    """Set user profile photo."""
-    photo_file_id = request.json['photo']
-
-    conn = get_db_connection()
-
-    conn.execute(
-        'UPDATE user_profile_photos SET is_current = FALSE WHERE user_id = ?',
-        (user['id'],)
-    )
-
-    conn.execute('''
-        INSERT INTO user_profile_photos (user_id, file_id, is_current)
-        VALUES (?, ?, TRUE)
-    ''', (user['id'], photo_file_id))
-
-    conn.commit()
-    conn.close()
-
-    return jsonify({
-        'ok': True,
-        'result': 'Profile photo updated successfully'
-    })
-
-@token_required
-def get_user_profile_photos(user: sqlite3.Row) -> JSONResponse:
-    """Get user profile photos."""
-    target_user_id = request.args.get('user_id', user['id'])
-    limit = min(int(request.args.get('limit', 10)), 100)
-    offset = int(request.args.get('offset', 0))
-
-    conn = get_db_connection()
-
-    photos = conn.execute('''
-        SELECT * FROM user_profile_photos
-        WHERE user_id = ?
-        ORDER BY is_current DESC, created_at DESC
-        LIMIT ? OFFSET ?
-    ''', (target_user_id, limit, offset)).fetchall()
-
-    result = []
-    for photo in photos:
-        result.append({
-            'file_id': photo['file_id'],
-            'file_size': photo['file_size'],
-            'width': photo['width'],
-            'height': photo['height'],
-            'is_current': bool(photo['is_current']),
-            'created_at': photo['created_at']
-        })
-
-    conn.close()
-    return jsonify({'ok': True, 'result': result})
-
-@token_required
-@validate_json({'chat_id': int, 'permissions': dict})
-def set_chat_permissions(user: sqlite3.Row) -> JSONResponse:
-    """Set chat permissions."""
-    chat_id = request.json['chat_id']
-    permissions = request.json['permissions']
-
-    conn = get_db_connection()
-
-    user_permissions = conn.execute('''
-        SELECT status FROM chat_members
-        WHERE chat_id = ? AND user_id = ? AND status IN ('creator', 'administrator')
-    ''', (chat_id, user['id'])).fetchone()
-
-    if not user_permissions:
-        conn.close()
-        return jsonify({
-            'ok': False,
-            'error_code': 403,
-            'description': 'Not authorized to change chat permissions'
-        }), 403
-
-    conn.execute('''
-        INSERT OR REPLACE INTO chat_permissions
-        (chat_id, can_send_messages, can_send_media_messages, can_send_polls,
-         can_send_other_messages, can_add_web_page_previews, can_change_info,
-         can_invite_users, can_pin_messages, can_manage_chat, can_manage_video_chats,
-         can_restrict_members, can_promote_members)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-    ''', (
-        chat_id,
-        permissions.get('can_send_messages', True),
-        permissions.get('can_send_media_messages', True),
-        permissions.get('can_send_polls', True),
-        permissions.get('can_send_other_messages', True),
-        permissions.get('can_add_web_page_previews', True),
-        permissions.get('can_change_info', False),
-        permissions.get('can_invite_users', False),
-        permissions.get('can_pin_messages', False),
-        permissions.get('can_manage_chat', False),
-        permissions.get('can_manage_video_chats', False),
-        permissions.get('can_restrict_members', False),
-        permissions.get('can_promote_members', False)
-    ))
-
-    conn.commit()
-    conn.close()
-
-    return jsonify({
-        'ok': True,
-        'result': 'Chat permissions updated successfully'
-    })
-
-@token_required
 @validate_json({'chat_id': int, 'title': str})
 def start_video_chat(user: sqlite3.Row) -> JSONResponse:
-    """Start a video chat."""
-    chat_id = request.json['chat_id']
-    title = request.json['title']
+    data = request.get_json()
+    chat_id = data['chat_id']
+    title = data.get('title', 'Video Chat')
 
     conn = get_db_connection()
 
-    membership = conn.execute(
-        'SELECT * FROM chat_members WHERE chat_id = ? AND user_id = ? AND status NOT IN ("left", "kicked")',
+    user_status = conn.execute(
+        'SELECT status FROM chat_members WHERE chat_id = ? AND user_id = ?',
         (chat_id, user['id'])
     ).fetchone()
 
-    if not membership:
+    if not user_status or user_status['status'] not in ['creator', 'administrator']:
         conn.close()
         return jsonify({
             'ok': False,
             'error_code': 403,
-            'description': 'Not a member of this chat'
+            'description': 'You do not have permission to start video chats'
         }), 403
 
-    conn.execute('''
-        INSERT INTO video_chats (chat_id, title, created_by)
-        VALUES (?, ?, ?)
-    ''', (chat_id, title, user['id']))
-
-    video_chat_id = conn.execute('SELECT last_insert_rowid()').fetchone()[0]
-
-    conn.execute('''
-        INSERT INTO video_chat_participants (video_chat_id, user_id)
-        VALUES (?, ?)
-    ''', (video_chat_id, user['id']))
-
-    conn.commit()
-
-    video_chat = conn.execute(
-        'SELECT * FROM video_chats WHERE id = ?',
-        (video_chat_id,)
+    active_chat = conn.execute(
+        'SELECT id FROM video_chats WHERE chat_id = ? AND is_active = TRUE',
+        (chat_id,)
     ).fetchone()
 
-    conn.close()
+    if active_chat:
+        conn.close()
+        return jsonify({
+            'ok': False,
+            'error_code': 409,
+            'description': 'Video chat is already active in this chat'
+        }), 409
 
-    return jsonify({
-        'ok': True,
-        'result': {
+    try:
+        cursor = conn.cursor()
+        cursor.execute(
+            '''INSERT INTO video_chats
+            (chat_id, title, created_by, participant_count)
+            VALUES (?, ?, ?, 1)''',
+            (chat_id, title, user['id'])
+        )
+        video_chat_id = cursor.lastrowid
+
+        cursor.execute(
+            '''INSERT INTO video_chat_participants
+            (video_chat_id, user_id, join_time)
+            VALUES (?, ?, CURRENT_TIMESTAMP)''',
+            (video_chat_id, user['id'])
+        )
+        conn.commit()
+
+        video_chat = conn.execute(
+            'SELECT * FROM video_chats WHERE id = ?',
+            (video_chat_id,)
+        ).fetchone()
+
+        conn.close()
+
+        video_chat_data = {
             'id': video_chat['id'],
             'chat_id': video_chat['chat_id'],
             'title': video_chat['title'],
             'created_by': video_chat['created_by'],
             'start_date': video_chat['start_date'],
+            'participant_count': video_chat['participant_count'],
             'is_active': bool(video_chat['is_active'])
         }
-    })
 
-@token_required
+        return jsonify({'ok': True, 'result': video_chat_data})
+
+    except sqlite3.Error as e:
+        conn.close()
+        return jsonify({
+            'ok': False,
+            'error_code': 500,
+            'description': f'Database error: {str(e)}'
+        }), 500
+
 @validate_json({'video_chat_id': int})
 def join_video_chat(user: sqlite3.Row) -> JSONResponse:
-    """Join a video chat."""
-    video_chat_id = request.json['video_chat_id']
+    data = request.get_json()
+    video_chat_id = data['video_chat_id']
 
     conn = get_db_connection()
 
@@ -3324,21 +4826,21 @@ def join_video_chat(user: sqlite3.Row) -> JSONResponse:
             'description': 'Video chat not found or not active'
         }), 404
 
-    membership = conn.execute(
-        'SELECT * FROM chat_members WHERE chat_id = ? AND user_id = ? AND status NOT IN ("left", "kicked")',
+    is_member = conn.execute(
+        'SELECT 1 FROM chat_members WHERE chat_id = ? AND user_id = ?',
         (video_chat['chat_id'], user['id'])
     ).fetchone()
 
-    if not membership:
+    if not is_member:
         conn.close()
         return jsonify({
             'ok': False,
             'error_code': 403,
-            'description': 'Not a member of this chat'
+            'description': 'You are not a member of this chat'
         }), 403
 
     existing_participant = conn.execute(
-        'SELECT * FROM video_chat_participants WHERE video_chat_id = ? AND user_id = ? AND leave_time IS NULL',
+        'SELECT id FROM video_chat_participants WHERE video_chat_id = ? AND user_id = ? AND leave_time IS NULL',
         (video_chat_id, user['id'])
     ).fetchone()
 
@@ -3346,50 +4848,95 @@ def join_video_chat(user: sqlite3.Row) -> JSONResponse:
         conn.close()
         return jsonify({
             'ok': False,
-            'error_code': 400,
-            'description': 'Already in this video chat'
-        }), 400
+            'error_code': 409,
+            'description': 'Already joined this video chat'
+        }), 409
 
-    conn.execute('''
-        INSERT INTO video_chat_participants (video_chat_id, user_id)
-        VALUES (?, ?)
-    ''', (video_chat_id, user['id']))
+    try:
+        cursor = conn.cursor()
+        cursor.execute(
+            '''INSERT INTO video_chat_participants
+            (video_chat_id, user_id, join_time)
+            VALUES (?, ?, CURRENT_TIMESTAMP)''',
+            (video_chat_id, user['id'])
+        )
 
-    conn.execute('''
-        UPDATE video_chats
-        SET participant_count = participant_count + 1
-        WHERE id = ?
-    ''', (video_chat_id,))
+        cursor.execute(
+            'UPDATE video_chats SET participant_count = participant_count + 1 WHERE id = ?',
+            (video_chat_id,)
+        )
+        conn.commit()
 
-    conn.commit()
-    conn.close()
+        participant = conn.execute('''
+            SELECT vcp.*, u.username, u.first_name, u.last_name
+            FROM video_chat_participants vcp
+            JOIN users u ON vcp.user_id = u.id
+            WHERE vcp.id = ?
+        ''', (cursor.lastrowid,)).fetchone()
 
-    return jsonify({
-        'ok': True,
-        'result': 'Joined video chat successfully'
-    })
+        conn.close()
 
-@token_required
-@validate_json({'message_id': int})
+        participant_data = {
+            'id': participant['id'],
+            'video_chat_id': participant['video_chat_id'],
+            'user': {
+                'id': participant['user_id'],
+                'username': participant['username'],
+                'first_name': participant['first_name'],
+                'last_name': participant['last_name']
+            },
+            'join_time': participant['join_time'],
+            'is_muted': bool(participant['is_muted']),
+            'is_video_enabled': bool(participant['is_video_enabled'])
+        }
+
+        return jsonify({'ok': True, 'result': participant_data})
+
+    except sqlite3.Error as e:
+        conn.close()
+        return jsonify({
+            'ok': False,
+            'error_code': 500,
+            'description': f'Database error: {str(e)}'
+        }), 500
+
 def get_message_statistics(user: sqlite3.Row) -> JSONResponse:
-    """Get message statistics."""
-    message_id = request.json['message_id']
+    message_id = request.args.get('message_id', type=int)
+
+    if not message_id:
+        return jsonify({
+            'ok': False,
+            'error_code': 400,
+            'description': 'message_id parameter is required'
+        }), 400
 
     conn = get_db_connection()
 
-    message = conn.execute('''
-        SELECT m.* FROM messages m
-        JOIN chat_members cm ON m.chat_id = cm.chat_id
-        WHERE m.id = ? AND cm.user_id = ? AND cm.status NOT IN ("left", "kicked")
-    ''', (message_id, user['id'])).fetchone()
+    message = conn.execute(
+        'SELECT * FROM messages WHERE id = ?',
+        (message_id,)
+    ).fetchone()
 
     if not message:
         conn.close()
         return jsonify({
             'ok': False,
             'error_code': 404,
-            'description': 'Message not found or access denied'
+            'description': 'Message not found'
         }), 404
+
+    is_member = conn.execute(
+        'SELECT 1 FROM chat_members WHERE chat_id = ? AND user_id = ?',
+        (message['chat_id'], user['id'])
+    ).fetchone()
+
+    if not is_member:
+        conn.close()
+        return jsonify({
+            'ok': False,
+            'error_code': 403,
+            'description': 'You are not a member of this chat'
+        }), 403
 
     stats = conn.execute(
         'SELECT * FROM message_stats WHERE message_id = ?',
@@ -3406,210 +4953,308 @@ def get_message_statistics(user: sqlite3.Row) -> JSONResponse:
     else:
         stats = dict(stats)
 
+    reactions = conn.execute(
+        'SELECT COUNT(*) as count FROM reactions WHERE message_id = ?',
+        (message_id,)
+    ).fetchone()['count']
+
+    stats['reaction_count'] = reactions
+
     conn.close()
+    return jsonify({'ok': True, 'result': stats})
 
-    return jsonify({
-        'ok': True,
-        'result': stats
-    })
-
-@token_required
 def get_user_statistics(user: sqlite3.Row) -> JSONResponse:
-    """Get user statistics."""
-    target_user_id = request.args.get('user_id', user['id'])
-
-    if target_user_id != user['id']:
-        pass
+    user_id = request.args.get('user_id', type=int) or user['id']
 
     conn = get_db_connection()
 
-    stats = conn.execute(
+    user_stats = conn.execute(
         'SELECT * FROM user_stats WHERE user_id = ?',
-        (target_user_id,)
+        (user_id,)
     ).fetchone()
 
-    if not stats:
-        conn.execute('''
-            INSERT INTO user_stats (user_id) VALUES (?)
-        ''', (target_user_id,))
-        conn.commit()
-
-        stats = conn.execute(
-            'SELECT * FROM user_stats WHERE user_id = ?',
-            (target_user_id,)
-        ).fetchone()
-
-    group_count = conn.execute(
-        'SELECT COUNT(*) FROM chat_members WHERE user_id = ? AND status NOT IN ("left", "kicked") AND chat_id IN (SELECT id FROM chats WHERE type != "private")',
-        (target_user_id,)
-    ).fetchone()[0]
-
-    conn.close()
-
-    result = dict(stats)
-    result['group_count'] = group_count
-
-    return jsonify({
-        'ok': True,
-        'result': result
-    })
-
-@token_required
-@validate_json({'chat_id': int, 'user_id': int, 'custom_title': str})
-def set_member_custom_title(user: sqlite3.Row) -> JSONResponse:
-    """Set custom title for a chat member."""
-    chat_id = request.json['chat_id']
-    target_user_id = request.json['user_id']
-    custom_title = request.json['custom_title']
-
-    if len(custom_title) > 16:
-        return jsonify({
-            'ok': False,
-            'error_code': 400,
-            'description': 'Custom title is too long (max 16 characters)'
-        }), 400
-
-    conn = get_db_connection()
-
-    user_permissions = conn.execute('''
-        SELECT status FROM chat_members
-        WHERE chat_id = ? AND user_id = ? AND status IN ('creator', 'administrator')
-    ''', (chat_id, user['id'])).fetchone()
-
-    if not user_permissions:
-        conn.close()
-        return jsonify({
-            'ok': False,
-            'error_code': 403,
-            'description': 'Not authorized to set custom titles'
-        }), 403
-
-    target_member = conn.execute(
-        'SELECT * FROM chat_members WHERE chat_id = ? AND user_id = ?',
-        (chat_id, target_user_id)
-    ).fetchone()
-
-    if not target_member:
+    if not user_stats:
         conn.close()
         return jsonify({
             'ok': False,
             'error_code': 404,
-            'description': 'User is not a member of this chat'
+            'description': 'User statistics not found'
         }), 404
 
-    conn.execute('''
-        UPDATE chat_members
-        SET custom_title = ?
-        WHERE chat_id = ? AND user_id = ?
-    ''', (custom_title, chat_id, target_user_id))
+    stats = dict(user_stats)
 
-    conn.commit()
     conn.close()
+    return jsonify({'ok': True, 'result': stats})
 
-    return jsonify({
-        'ok': True,
-        'result': 'Custom title set successfully'
-    })
-
-@token_required
 @validate_json({'chat_id': int, 'message_id': int})
 def view_message(user: sqlite3.Row) -> JSONResponse:
-    """Increment message view count."""
-    chat_id = request.json['chat_id']
-    message_id = request.json['message_id']
+    data = request.get_json()
+    chat_id = data['chat_id']
+    message_id = data['message_id']
 
     conn = get_db_connection()
 
-    message = conn.execute('''
-        SELECT m.* FROM messages m
-        JOIN chat_members cm ON m.chat_id = cm.chat_id
-        WHERE m.chat_id = ? AND m.message_id = ? AND cm.user_id = ? AND cm.status NOT IN ("left", "kicked")
-    ''', (chat_id, message_id, user['id'])).fetchone()
+    is_member = conn.execute(
+        'SELECT 1 FROM chat_members WHERE chat_id = ? AND user_id = ?',
+        (chat_id, user['id'])
+    ).fetchone()
+
+    if not is_member:
+        conn.close()
+        return jsonify({
+            'ok': False,
+            'error_code': 403,
+            'description': 'You are not a member of this chat'
+        }), 403
+
+    message = conn.execute(
+        'SELECT * FROM messages WHERE chat_id = ? AND message_id = ?',
+        (chat_id, message_id)
+    ).fetchone()
 
     if not message:
         conn.close()
         return jsonify({
             'ok': False,
             'error_code': 404,
-            'description': 'Message not found or access denied'
+            'description': 'Message not found'
         }), 404
 
-    conn.execute('''
-        INSERT INTO message_stats (message_id, view_count)
-        VALUES (?, 1)
-        ON CONFLICT(message_id) DO UPDATE SET view_count = view_count + 1
-    ''', (message['id'],))
+    try:
+        existing_view = conn.execute(
+            'SELECT * FROM message_views WHERE message_id = ? AND user_id = ?',
+            (message['id'], user['id'])
+        ).fetchone()
 
-    conn.execute('''
-        INSERT INTO user_stats (user_id, message_count)
-        VALUES (?, 1)
-        ON CONFLICT(user_id) DO UPDATE SET message_count = message_count + 1
-    ''', (message['from_user_id'],))
+        if existing_view:
+            conn.execute(
+                'UPDATE message_views SET view_count = view_count + 1, viewed_at = CURRENT_TIMESTAMP WHERE id = ?',
+                (existing_view['id'],)
+            )
+        else:
+            conn.execute(
+                'INSERT INTO message_views (message_id, user_id) VALUES (?, ?)',
+                (message['id'], user['id'])
+            )
 
-    conn.commit()
-    conn.close()
+        conn.execute(
+            'UPDATE messages SET views = views + 1 WHERE id = ?',
+            (message['id'],)
+        )
 
-    return jsonify({
-        'ok': True,
-        'result': 'Message view recorded'
-    })
+        conn.commit()
+        conn.close()
 
-@token_required
-@validate_json({'chat_id': int, 'days': int})
-def get_chat_activity_stats(user: sqlite3.Row) -> JSONResponse:
-    """Get chat activity statistics."""
-    chat_id = request.json['chat_id']
-    days = min(request.json.get('days', 7), 30)
+        return jsonify({
+            'ok': True,
+            'result': {
+                'success': True,
+                'description': 'Message view recorded'
+            }
+        })
+
+    except sqlite3.Error as e:
+        conn.close()
+        return jsonify({
+            'ok': False,
+            'error_code': 500,
+            'description': f'Database error: {str(e)}'
+        }), 500
+
+def get_message_views_count(user: sqlite3.Row) -> JSONResponse:
+    message_id = request.args.get('message_id', type=int)
+
+    if not message_id:
+        return jsonify({
+            'ok': False,
+            'error_code': 400,
+            'description': 'message_id parameter is required'
+        }), 400
+
     conn = get_db_connection()
 
-    membership = conn.execute(
-        'SELECT * FROM chat_members WHERE chat_id = ? AND user_id = ? AND status NOT IN ("left", "kicked")',
-        (chat_id, user['id'])
+    message = conn.execute(
+        'SELECT * FROM messages WHERE id = ?',
+        (message_id,)
     ).fetchone()
 
-    if not membership:
+    if not message:
+        conn.close()
+        return jsonify({
+            'ok': False,
+            'error_code': 404,
+            'description': 'Message not found'
+        }), 404
+
+    is_member = conn.execute(
+        'SELECT 1 FROM chat_members WHERE chat_id = ? AND user_id = ?',
+        (message['chat_id'], user['id'])
+    ).fetchone()
+
+    if not is_member:
         conn.close()
         return jsonify({
             'ok': False,
             'error_code': 403,
-            'description': 'Not a member of this chat'
+            'description': 'You are not a member of this chat'
         }), 403
 
-    daily_stats = conn.execute('''
-        SELECT DATE(date) as day, COUNT(*) as message_count
-        FROM messages
-        WHERE chat_id = ? AND date >= datetime('now', ? || ' days')
-        GROUP BY DATE(date)
-        ORDER BY day DESC
-    ''', (chat_id, f'-{days}')).fetchall()
-
-    top_users = conn.execute('''
-        SELECT u.id, u.username, u.first_name, u.last_name, COUNT(*) as message_count
-        FROM messages m
-        JOIN users u ON m.from_user_id = u.id
-        WHERE m.chat_id = ? AND m.date >= datetime('now', ? || ' days')
-        GROUP BY m.from_user_id
-        ORDER BY message_count DESC
-        LIMIT 10
-    ''', (chat_id, f'-{days}')).fetchall()
+    views_count = conn.execute(
+        'SELECT SUM(view_count) as total_views FROM message_views WHERE message_id = ?',
+        (message_id,)
+    ).fetchone()['total_views'] or 0
 
     conn.close()
+    return jsonify({'ok': True, 'result': views_count})
 
-    result = {
-        'period_days': days,
-        'daily_stats': [{'day': stat['day'], 'message_count': stat['message_count']} for stat in daily_stats],
-        'top_users': [{
-            'id': user['id'],
-            'username': user['username'],
-            'first_name': user['first_name'],
-            'last_name': user['last_name'],
-            'message_count': user['message_count']
-        } for user in top_users]
-    }
+def get_message_viewers(user: sqlite3.Row) -> JSONResponse:
+    message_id = request.args.get('message_id', type=int)
+    limit = request.args.get('limit', 50, type=int)
+    offset = request.args.get('offset', 0, type=int)
 
+    if not message_id:
+        return jsonify({
+            'ok': False,
+            'error_code': 400,
+            'description': 'message_id parameter is required'
+        }), 400
+
+    conn = get_db_connection()
+
+    message = conn.execute(
+        'SELECT * FROM messages WHERE id = ?',
+        (message_id,)
+    ).fetchone()
+
+    if not message:
+        conn.close()
+        return jsonify({
+            'ok': False,
+            'error_code': 404,
+            'description': 'Message not found'
+        }), 404
+
+    is_member = conn.execute(
+        'SELECT 1 FROM chat_members WHERE chat_id = ? AND user_id = ?',
+        (message['chat_id'], user['id'])
+    ).fetchone()
+
+    if not is_member:
+        conn.close()
+        return jsonify({
+            'ok': False,
+            'error_code': 403,
+            'description': 'You are not a member of this chat'
+        }), 403
+
+    viewers = conn.execute('''
+        SELECT mv.*, u.username, u.first_name, u.last_name
+        FROM message_views mv
+        JOIN users u ON mv.user_id = u.id
+        WHERE mv.message_id = ?
+        ORDER BY mv.viewed_at DESC
+        LIMIT ? OFFSET ?
+    ''', (message_id, limit, offset)).fetchall()
+
+    result = []
+    for viewer in viewers:
+        viewer_data = {
+            'user': {
+                'id': viewer['user_id'],
+                'username': viewer['username'],
+                'first_name': viewer['first_name'],
+                'last_name': viewer['last_name']
+            },
+            'view_count': viewer['view_count'],
+            'last_viewed': viewer['viewed_at']
+        }
+        result.append(viewer_data)
+
+    conn.close()
     return jsonify({'ok': True, 'result': result})
 
-init_db()
+def get_user_message_views(user: sqlite3.Row) -> JSONResponse:
+    target_user_id = request.args.get('user_id', type=int) or user['id']
+    limit = request.args.get('limit', 50, type=int)
+    offset = request.args.get('offset', 0, type=int)
+
+    conn = get_db_connection()
+
+    message_views = conn.execute('''
+        SELECT mv.*, m.message_id, m.chat_id, c.title as chat_title
+        FROM message_views mv
+        JOIN messages m ON mv.message_id = m.id
+        JOIN chats c ON m.chat_id = c.id
+        WHERE mv.user_id = ?
+        ORDER BY mv.viewed_at DESC
+        LIMIT ? OFFSET ?
+    ''', (target_user_id, limit, offset)).fetchall()
+
+    result = []
+    for view in message_views:
+        view_data = {
+            'message_id': view['message_id'],
+            'chat': {
+                'id': view['chat_id'],
+                'title': view['chat_title']
+            },
+            'view_count': view['view_count'],
+            'last_viewed': view['viewed_at']
+        }
+        result.append(view_data)
+
+    conn.close()
+    return jsonify({'ok': True, 'result': result})
+
+def get_chat_activity_stats(user: sqlite3.Row) -> JSONResponse:
+    chat_id = request.args.get('chat_id', type=int)
+    days = request.args.get('days', 7, type=int)
+
+    if not chat_id:
+        return jsonify({
+            'ok': False,
+            'error_code': 400,
+            'description': 'chat_id parameter is required'
+        }), 400
+
+    conn = get_db_connection()
+
+    is_member = conn.execute(
+        'SELECT 1 FROM chat_members WHERE chat_id = ? AND user_id = ?',
+        (chat_id, user['id'])
+    ).fetchone()
+
+    if not is_member:
+        conn.close()
+        return jsonify({
+            'ok': False,
+            'error_code': 403,
+            'description': 'You are not a member of this chat'
+        }), 403
+
+    activity_stats = conn.execute('''
+        SELECT
+            DATE(date) as day,
+            COUNT(*) as message_count,
+            COUNT(DISTINCT from_user_id) as active_users
+        FROM messages
+        WHERE chat_id = ? AND date >= DATE('now', ?)
+        GROUP BY DATE(date)
+        ORDER BY day DESC
+    ''', (chat_id, f'-{days} days')).fetchall()
+
+    result = []
+    for stat in activity_stats:
+        stat_data = {
+            'day': stat['day'],
+            'message_count': stat['message_count'],
+            'active_users': stat['active_users']
+        }
+        result.append(stat_data)
+
+    conn.close()
+    return jsonify({'ok': True, 'result': result})
 
 if __name__ == '__main__':
-    app.run()
+    init_db()
+    app.run(debug=True)
